@@ -78,11 +78,16 @@ On the free tier, Phase 3 spreads over 2–3 days of reconnects; the resume logi
 **Wrong GPU (not T4).** Phase 0's assert stops you. Runtime → Disconnect and delete runtime →
 reconnect until you get a T4. Never mix latency numbers across GPU types.
 
-**OOM (usually at the 8k bucket).** If Phase 0's peak-VRAM assert trips, or a run OOMs on the
-top bucket: cap the top bucket at 6k. Edit `config.BUCKETS` to `[512, 1024, 2048, 4096, 6144]`
-and re-run Phase 1 (data) → Phase 2/3. `logits_to_keep=1` is already applied on every forward,
-which removes the ~4.2 GB fp32 8k-prefill logits transient; if you still OOM, the KV cache is
-the cause and 6k is the fix.
+**OOM (usually at the 8k bucket).** Two mitigations are already baked in: `logits_to_keep=1` on
+every forward (removes the ~4.2 GB fp32 prefill-logits transient) and `attention_mask=None` on
+every forward (an all-ones mask would force SDPA's math backend on Turing and materialize a
+`(1, heads, 8192, 8192)` fp32 score tensor — the classic 6 GiB OOM; `None` takes the `is_causal`
+fast path). If Phase 0's peak-VRAM assert still trips or a run OOMs on the top bucket, escalate
+in this order:
+1. **Chunked prefill** — set `cfg.prefill_chunk_size = 512` (in Cell 5) to build the 8k KV cache
+   incrementally instead of in one forward. Bounds peak activation memory; decode is unchanged.
+2. **Cap the top bucket at 6k** — edit `config.BUCKETS` to `[512, 1024, 2048, 4096, 6144]` and
+   re-run Phase 1 (data) → Phase 2/3. Do this if the KV cache itself (not activations) is the cause.
 
 **Disconnect mid-run.** Expected on free Colab. Just reconnect and re-run the current phase's
 cell. Completed `(model, method, bucket, item_id)` tuples are skipped; a half-written last line

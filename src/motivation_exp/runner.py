@@ -57,6 +57,7 @@ class DecodeCfg:
     per_step_cap: int = 48
     temp_schedule: tuple[float, ...] = (0.7, 0.9, 1.1)
     max_retries: int = 3
+    prefill_chunk_size: int | None = None  # set (e.g. 512) only if an 8k prefill still OOMs
 
 
 # --------------------------------------------------------------------------------------
@@ -312,9 +313,13 @@ def make_torch_helpers():
 class HFModelBackend:
     """Manual-loop backend over an HF causal LM with a DynamicCache and fp16 forwards.
 
-    ``logits_to_keep=1`` on every call (rev #1). Never passes ``cache_position`` -- positions
-    are derived from the cache length so rollback via ``crop`` "just works" (only an
-    all-ones ``attention_mask`` sized to the cache is supplied).
+    ``logits_to_keep=1`` on every call (rev #1). Both ``cache_position`` AND ``attention_mask``
+    are left as ``None``: with batch=1 and no padding an all-ones mask is a no-op that forces
+    transformers to build an explicit 4D additive mask (SDPA ``is_causal=False`` -> math
+    backend), which on Turing materializes a (1, heads, L, L) fp32 score tensor -- the 8k OOM.
+    ``attention_mask=None`` takes the ``is_causal=True`` fast path and derives ``cache_position``
+    from ``cache.get_seq_length()``, which is exactly what the crop/re-feed rollback relies on,
+    so rollback semantics are unchanged.
     """
 
     def __init__(self, model, sync: Callable[[], None]):
@@ -328,22 +333,31 @@ class HFModelBackend:
         self.cache = DynamicCache()
         self.forward_s = 0.0
 
-    def _attn(self, extra: int):
-        return self._torch.ones(
-            (1, self.cache.get_seq_length() + extra), device=self.device, dtype=self._torch.long
-        )
+    def prefill(self, input_ids, chunk_size: int | None = None):
+        """Prefill the KV cache and return the last-token logits.
 
-    def prefill(self, input_ids):
+        If ``chunk_size`` is set, the prompt is fed in chunks so peak activation memory stays
+        bounded (build the cache incrementally); attention stays causal across chunks because
+        each chunk attends the cache. Use this only if an 8k prefill still OOMs after the
+        ``attention_mask=None`` fix (see RUNBOOK).
+        """
         torch = self._torch
         input_ids = input_ids.to(self.device)
-        attn = torch.ones_like(input_ids)
         self.sync()
         t0 = time.perf_counter()
         with torch.inference_mode():
-            out = self.model(
-                input_ids=input_ids, attention_mask=attn, past_key_values=self.cache,
-                use_cache=True, logits_to_keep=1,
-            )
+            if chunk_size is None or input_ids.shape[1] <= chunk_size:
+                out = self.model(
+                    input_ids=input_ids, attention_mask=None, past_key_values=self.cache,
+                    use_cache=True, logits_to_keep=1,
+                )
+            else:
+                out = None
+                for s in range(0, input_ids.shape[1], chunk_size):
+                    out = self.model(
+                        input_ids=input_ids[:, s:s + chunk_size], attention_mask=None,
+                        past_key_values=self.cache, use_cache=True, logits_to_keep=1,
+                    )
         self.sync()
         self.forward_s += time.perf_counter() - t0
         return out.logits[0, -1, :]
@@ -351,12 +365,11 @@ class HFModelBackend:
     def decode_step(self, token_id: int):
         torch = self._torch
         ids = torch.tensor([[int(token_id)]], device=self.device, dtype=torch.long)
-        attn = self._attn(1)
         self.sync()
         t0 = time.perf_counter()
         with torch.inference_mode():
             out = self.model(
-                input_ids=ids, attention_mask=attn, past_key_values=self.cache,
+                input_ids=ids, attention_mask=None, past_key_values=self.cache,
                 use_cache=True, logits_to_keep=1,
             )
         self.sync()
@@ -399,7 +412,7 @@ def run_unguided(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
     prompt_ids = build_prompt_ids(tokenizer, item, exemplar_item, exemplar_cot)
     backend = HFModelBackend(model, sync)
     sync(); t0 = time.perf_counter()
-    logits = backend.prefill(prompt_ids)
+    logits = backend.prefill(prompt_ids, chunk_size=cfg.prefill_chunk_size)
     prefill_wall = time.perf_counter() - t0
 
     gen: list[int] = []
@@ -440,7 +453,7 @@ def run_symbolic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
     gpu_bitmask = torch.empty_like(cpu_bitmask, device=backend.device)  # rev #9: preallocate
 
     sync(); t0 = time.perf_counter()
-    logits = backend.prefill(prompt_ids)
+    logits = backend.prefill(prompt_ids, chunk_size=cfg.prefill_chunk_size)
     prefill_wall = time.perf_counter() - t0
 
     gen: list[int] = []
@@ -475,7 +488,7 @@ def run_semantic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
     backend = HFModelBackend(model, sync)
 
     sync(); t0 = time.perf_counter()
-    logits = backend.prefill(prompt_ids)
+    logits = backend.prefill(prompt_ids, chunk_size=cfg.prefill_chunk_size)
     prefill_wall = time.perf_counter() - t0
 
     te = time.perf_counter()
