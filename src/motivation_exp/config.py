@@ -50,7 +50,7 @@ PRONTOQA_REPO = "https://github.com/asaparov/prontoqa"
 PRONTOQA_COMMIT = "0a6412b6fddf46324a1cb96e066dd7b3d89b87d6"  # <-- user confirms the exact hash in the notebook.
 
 # Your own package repo, cloned + `pip install -e .` on Colab. Placeholder for the user.
-SELF_REPO = "https://github.com/PLACEHOLDER/dag-motivation-exp"
+SELF_REPO = "https://github.com/knx4dmn/dag-motivation-exp"
 SELF_COMMIT = "PLACEHOLDER_PIN_ME"
 
 # --------------------------------------------------------------------------------------
@@ -73,6 +73,16 @@ N_EXEMPLAR_ITEMS = 1     # few-shot exemplar(s); independent ontology, never in 
 # --------------------------------------------------------------------------------------
 MAX_NEW_TOKENS = 256
 N_WARMUP = 3             # untimed warmup generations after every model load (rev #4)
+
+# Chunked prefill is REQUIRED on T4, not optional. Llama-3.2-3B uses GQA (24 query heads vs
+# 8 KV heads); PyTorch's mem-efficient SDPA kernel rejects mismatched head counts, flash is
+# unavailable on sm75, and cuDNN is rejected -- so SDPA ALWAYS falls back to the math backend
+# for this model on this GPU. A single 8k prefill then materializes a (1, 24, 8192, 8192) score
+# tensor whose fp32 softmax upcast is the ~6 GiB OOM. Feeding the prompt in PREFILL_CHUNK-token
+# chunks (building the KV cache incrementally) caps the per-chunk score tensor at ~400 MB.
+# Lower this if 8k still peaks too high. Prefill is excluded from Panel B, so the metric is
+# unchanged; the full chunked prefill is still timed into prefill_wall_s.
+PREFILL_CHUNK = 512
 
 # Semantic checker rollback (plan section 4.3, rev #5/#6)
 SEMANTIC_MAX_RETRIES = 3

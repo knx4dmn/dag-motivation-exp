@@ -57,7 +57,9 @@ class DecodeCfg:
     per_step_cap: int = 48
     temp_schedule: tuple[float, ...] = (0.7, 0.9, 1.1)
     max_retries: int = 3
-    prefill_chunk_size: int | None = None  # set (e.g. 512) only if an 8k prefill still OOMs
+    # REQUIRED on T4 (default 512): SDPA runs the math backend for this GQA model on sm75, so a
+    # one-shot 8k prefill OOMs; chunking builds the KV cache incrementally. None disables it.
+    prefill_chunk_size: int | None = 512
 
 
 # --------------------------------------------------------------------------------------
@@ -333,13 +335,15 @@ class HFModelBackend:
         self.cache = DynamicCache()
         self.forward_s = 0.0
 
-    def prefill(self, input_ids, chunk_size: int | None = None):
+    def prefill(self, input_ids, chunk_size: int | None = 512):
         """Prefill the KV cache and return the last-token logits.
 
-        If ``chunk_size`` is set, the prompt is fed in chunks so peak activation memory stays
-        bounded (build the cache incrementally); attention stays causal across chunks because
-        each chunk attends the cache. Use this only if an 8k prefill still OOMs after the
-        ``attention_mask=None`` fix (see RUNBOOK).
+        ``chunk_size`` feeds the prompt in chunks so peak activation memory stays bounded
+        (build the cache incrementally); attention stays causal across chunks because each
+        chunk attends the cache. This is REQUIRED on T4, not a fallback: SDPA runs the math
+        backend for this GQA model on sm75 (see config.PREFILL_CHUNK), so a one-shot 8k prefill
+        materializes a (1, 24, 8192, 8192) score tensor and OOMs. The full chunked prefill is
+        timed into ``forward_s`` (prefill is excluded from Panel B, so the metric is unchanged).
         """
         torch = self._torch
         input_ids = input_ids.to(self.device)

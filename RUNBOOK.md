@@ -9,6 +9,17 @@ The experiment produces a two-panel figure:
 
 ---
 
+## Known hardware constraint (T4 + this model)
+
+On the T4 (Turing, sm75), PyTorch **SDPA always runs the math backend** for Llama-3.2-3B:
+the model uses GQA (24 query heads vs 8 KV heads), which the memory-efficient SDPA kernel
+rejects (mismatched head counts); FlashAttention needs sm80+ so it's unavailable; cuDNN is
+also rejected. The math backend materializes a full `(1, 24, L, L)` score tensor with an fp32
+softmax upcast — a one-shot 8k prefill is ~6 GiB and OOMs. **This is why prefill is chunked**
+(`config.PREFILL_CHUNK = 512`, incremental KV-cache build); decode steps are q_len=1 so their
+score tensor is `(1, 24, 1, L)` and trivially small. Nothing you can toggle changes the backend
+selection — chunked prefill is required, not optional. (This is stated in the figure caption too.)
+
 ## 0. Before you start (one-time)
 
 1. **Push this repo to GitHub** and note the URL + a commit hash. Edit Cell 1's `SELF_REPO`
@@ -78,14 +89,14 @@ On the free tier, Phase 3 spreads over 2–3 days of reconnects; the resume logi
 **Wrong GPU (not T4).** Phase 0's assert stops you. Runtime → Disconnect and delete runtime →
 reconnect until you get a T4. Never mix latency numbers across GPU types.
 
-**OOM (usually at the 8k bucket).** Two mitigations are already baked in: `logits_to_keep=1` on
-every forward (removes the ~4.2 GB fp32 prefill-logits transient) and `attention_mask=None` on
-every forward (an all-ones mask would force SDPA's math backend on Turing and materialize a
-`(1, heads, 8192, 8192)` fp32 score tensor — the classic 6 GiB OOM; `None` takes the `is_causal`
-fast path). If Phase 0's peak-VRAM assert still trips or a run OOMs on the top bucket, escalate
-in this order:
-1. **Chunked prefill** — set `cfg.prefill_chunk_size = 512` (in Cell 5) to build the 8k KV cache
-   incrementally instead of in one forward. Bounds peak activation memory; decode is unchanged.
+**OOM (usually at the 8k bucket).** Three mitigations are baked in: `logits_to_keep=1` on every
+forward (removes the ~4.2 GB fp32 prefill-logits transient), `attention_mask=None` (keeps
+decode-step score tensors small and takes the `is_causal` path), and **chunked prefill by
+default** (`config.PREFILL_CHUNK = 512`) — required because SDPA runs the math backend for this
+GQA model on sm75 (see "Known hardware constraint" above). If Phase 0's peak-VRAM assert still
+trips or a run OOMs on the top bucket, escalate in this order:
+1. **Lower the prefill chunk** — set `config.PREFILL_CHUNK = 256` (or 128). Smaller chunks →
+   smaller per-chunk score tensor. Cheapest fix; no data regen.
 2. **Cap the top bucket at 6k** — edit `config.BUCKETS` to `[512, 1024, 2048, 4096, 6144]` and
    re-run Phase 1 (data) → Phase 2/3. Do this if the KV cache itself (not activations) is the cause.
 

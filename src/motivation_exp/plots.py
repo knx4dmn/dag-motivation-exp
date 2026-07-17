@@ -160,7 +160,8 @@ def make_two_panel_figure(
     caption = (
         f"Check granularity: step-boundary. Latency: decode-phase per ACCEPTED output "
         f"token (prefill excluded; semantic numerator includes rollback + embedder). "
-        f"Hardware: single T4, fp16."
+        f"Hardware: single T4 (sm75), fp16; SDPA math backend (GQA head mismatch precludes the "
+        f"mem-efficient/flash kernels on this GPU), chunked prefill."
     )
     if model_name:
         caption = f"Model: {model_name}. " + caption
