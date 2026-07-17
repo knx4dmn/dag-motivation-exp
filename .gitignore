@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Local scratch / experiment outputs (produced on Colab/Drive, not versioned)
+data/
+results_*.jsonl
+*_manifest.json
+pip_freeze.txt
+motivation_figure.png
+motivation_figure.pdf
+constraints.txt
+
+# The cloned PrOntoQA generator (fetched at runtime, pinned by commit)
+prontoqa/

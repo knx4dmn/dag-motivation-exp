@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "motivation_exp"
+version = "0.1.0"
+description = "Symbolic vs. semantic structure-guided inference under growing context (PrOntoQA motivation experiment)"
+requires-python = ">=3.10"
+
+# IMPORTANT (rev #7 + verified locally): torch is DELIBERATELY absent from the CORE deps.
+# On Colab, torch is preinstalled against the runtime's exact CUDA driver; reinstalling it
+# via a transitive dep is the #1 cause of a broken T4 CUDA stack. `pip install -e .` (core)
+# must never pull torch.
+#
+# VERIFIED: `xgrammar==0.1.34` and `sentence-transformers==3.4.1` BOTH hard-require torch
+# (xgrammar also requires apache-tvm-ffi + transformers + pydantic). So they are NOT core
+# deps -- they live in the [colab] extra, which the notebook installs with a constraints
+# file that pins torch to the exact preinstalled version so pip cannot swap it out. The core
+# deps below are all torch-free (transformers does NOT hard-require torch).
+dependencies = [
+    "transformers==4.57.1",
+    "numpy>=1.26,<3",          # rev #7: hard 1.26 pin clashes with Colab's numpy-2.x ABI stack
+    "matplotlib==3.9.2",
+    "pandas>=2.0,<3",
+    "scipy>=1.11,<2",
+]
+
+[project.optional-dependencies]
+# Torch-dependent stack. Install on Colab as: pip install -e ".[colab]" -c constraints.txt
+# where constraints.txt pins torch==<preinstalled version> (see run_colab.ipynb / RUNBOOK).
+colab = [
+    "xgrammar==0.1.34",
+    "sentence-transformers==3.4.1",
+]
+test = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
