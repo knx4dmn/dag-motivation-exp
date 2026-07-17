@@ -47,7 +47,7 @@ PINS = {
 # Pinned upstream commit for the PrOntoQA generator. VERIFY/UPDATE before a run: this is
 # a placeholder for the latest github.com/asaparov/prontoqa commit at implementation time.
 PRONTOQA_REPO = "https://github.com/asaparov/prontoqa"
-PRONTOQA_COMMIT = "PLACEHOLDER_PIN_ME"  # <-- user confirms the exact hash in the notebook.
+PRONTOQA_COMMIT = "0a6412b6fddf46324a1cb96e066dd7b3d89b87d6"  # <-- user confirms the exact hash in the notebook.
 
 # Your own package repo, cloned + `pip install -e .` on Colab. Placeholder for the user.
 SELF_REPO = "https://github.com/PLACEHOLDER/dag-motivation-exp"
