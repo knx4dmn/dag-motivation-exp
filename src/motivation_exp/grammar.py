@@ -1,239 +1,283 @@
-"""Per-item EBNF construction, XGrammar compilation, and few-shot exemplar synthesis.
+"""Per-item EBNF, XGrammar compilation, exemplar validation, and the shared clause parser.
 
-The symbolic method constrains generation to a sequence of reasoning-step sentences over
-the item's in-context vocabulary, followed by a ``True``/``False`` answer line. This module
-holds the ONE definition of the allowed sentence forms (:data:`STEP_TEMPLATES`) from which
-three artifacts are derived so they cannot drift (the GAD failure mode, R2 #3):
+Built against PrOntoQA's ACTUAL sentence forms (verified from the cloned generator at the
+pinned commit). PrOntoQA ModusPonens reasoning mixes two predicate kinds:
 
-  1. the EBNF grammar productions (:func:`build_item_ebnf`),
-  2. a pure-Python conformance check (:func:`output_conforms`), used in CPU tests and as a
-     cheap sanity gate, and
-  3. the few-shot exemplar renderer (:func:`synthesize_exemplar_cot`).
+  * concept membership -- takes an article/pluralizes: ``Sally is a tumpus.`` /
+    ``Impuses are tumpuses.`` / ``Every impus is a zumpus.``
+  * property predication -- an adjective, no article, never pluralized:
+    ``Sally is not slow.`` / ``Tumpuses are not slow.`` / ``Each yumpus is shy.``
 
-XGrammar is imported lazily inside :func:`compile_item_grammar` / :func:`make_compiler` so
-this module is importable (and testable) without the native package or a tokenizer.
+subjects are a proper name (fact) or ``Every``/``Each`` + concept, or a capitalized plural
+concept (plural rule). PrOntoQA's property words are a FIXED, closed set (:data:`PROPERTY_WORDS`),
+so a bare (article-less) predicate is classified exactly, not guessed.
+
+One parser (:func:`parse_clause`) + one EBNF builder (:func:`build_item_ebnf`) + one conformance
+check (:func:`output_conforms`) are derived from the same form definitions so the symbolic
+grammar, the semantic checker, and the exemplar validation cannot drift.
 """
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Sequence
 
 # --------------------------------------------------------------------------------------
-# Step templates: the single source of truth for allowed sentence forms.
-#
-# A template is an ordered tuple of "parts". Each part is either a literal string or one of
-# the slot markers NAME / CONCEPT / ART. NAME and CONCEPT slots carry vocabulary; ART is a
-# derived article ("a"/"an") computed from the concept that immediately follows it.
+# Fixed PrOntoQA vocabulary (from run_experiment.py at the pinned commit)
 # --------------------------------------------------------------------------------------
-NAME, CONCEPT, ART = "NAME", "CONCEPT", "ART"
-
-STEP_TEMPLATES: dict[str, tuple] = {
-    # "Wren is a tumpus."
-    "entity_pos": (NAME, " is ", ART, " ", CONCEPT, "."),
-    # "Wren is not a tumpus."
-    "entity_neg": (NAME, " is not ", ART, " ", CONCEPT, "."),
-    # "Every tumpus is a wumpus."
-    "rule_pos": ("Every ", CONCEPT, " is ", ART, " ", CONCEPT, "."),
-    # "Every tumpus is not a wumpus."
-    "rule_neg": ("Every ", CONCEPT, " is not ", ART, " ", CONCEPT, "."),
-}
+# Property adjectives = the flattened property families (run_experiment.py lines ~356-368).
+PROPERTY_WORDS = frozenset({
+    "blue", "red", "brown", "orange", "small", "large", "metallic", "wooden", "luminous",
+    "liquid", "transparent", "opaque", "nervous", "happy", "feisty", "shy", "bright", "dull",
+    "sweet", "sour", "spicy", "bitter", "floral", "fruity", "earthy", "hot", "cold",
+    "temperate", "kind", "mean", "angry", "amenable", "aggressive", "melodic", "muffled",
+    "discordant", "loud", "slow", "moderate", "fast", "windy", "sunny", "overcast", "rainy",
+    "snowy",
+})
+# Proper names (run_experiment.py line 321).
+ENTITY_NAMES = ("Fae", "Rex", "Sally", "Max", "Alex", "Sam", "Polly", "Stella", "Wren")
 
 ANSWER_PREFIX = "The answer is "
 ANSWER_RE = re.compile(r"^" + re.escape(ANSWER_PREFIX) + r"(True|False)\.$")
 
 
-def _article(concept: str) -> str:
-    return "an" if concept[:1].lower() in "aeiou" else "a"
+def _article(word: str) -> str:
+    return "an" if word[:1].lower() in "aeiou" else "a"
+
+
+def plural_of(concept: str) -> str:
+    """PrOntoQA pluralizes concept nouns by appending 'es' (wumpus -> wumpuses)."""
+    return concept + "es"
+
+
+def _singular_of(plural: str) -> str:
+    return plural[:-2] if plural.endswith("es") else plural
 
 
 # --------------------------------------------------------------------------------------
-# Derivations from a template's parts
+# Clause model + parser (shared by datagen extraction, the checker, and conformance)
 # --------------------------------------------------------------------------------------
-def _slot_indices(parts: tuple) -> list[int]:
-    """Positions of NAME/CONCEPT slots (the ones that consume a filler), in order."""
-    return [i for i, p in enumerate(parts) if p in (NAME, CONCEPT)]
+@dataclass(frozen=True)
+class Clause:
+    """A parsed PrOntoQA sentence.
+
+    kind='fact': ``subject`` is an entity name; the clause asserts subject has ``pred``.
+    kind='rule': ``subject`` is the antecedent concept (singular); every such subject has ``pred``.
+    ``is_property`` distinguishes a property adjective from a concept noun. ``negated`` flips it.
+    """
+
+    kind: str            # "fact" | "rule"
+    subject: str         # entity name (fact) or antecedent concept, singular lowercase (rule)
+    pred: str            # concept (singular lowercase) or property word
+    is_property: bool
+    negated: bool
 
 
-def _next_concept_filler_index(parts: tuple, art_pos: int) -> int:
-    """Which filler index (into the NAME/CONCEPT filler list) the ART at ``art_pos`` refers to."""
-    fi = 0
-    for i, p in enumerate(parts):
-        if p in (NAME, CONCEPT):
-            if i > art_pos and p == CONCEPT:
-                return fi
-            fi += 1
-    raise ValueError("ART slot has no following CONCEPT")
+_NAME = r"[A-Z][a-zA-Z]*"
+_LWORD = r"[a-z][a-zA-Z]*"
+_CWORD = r"[A-Z][a-zA-Z]*"
+
+# fact:  "<Name> is [not] a|an <concept>."  |  "<Name> is [not] <property>."
+_FACT_CONCEPT = re.compile(rf"^({_NAME}) is (not )?(?:an?) ({_LWORD})\.$")
+_FACT_PROP = re.compile(rf"^({_NAME}) is (not )?({_LWORD})\.$")
+# singular rule: "Every|Each <concept> is [not] a|an <concept>." | "... <property>."
+_RULE_CONCEPT = re.compile(rf"^(?:Every|Each) ({_LWORD}) is (not )?(?:an?) ({_LWORD})\.$")
+_RULE_PROP = re.compile(rf"^(?:Every|Each) ({_LWORD}) is (not )?({_LWORD})\.$")
+# plural rule: "<Cplural> are [not] <cplural>." | "<Cplural> are [not] <property>."
+_PLURAL = re.compile(rf"^({_CWORD}) are (not )?({_LWORD})\.$")
 
 
-def render_template(template_id: str, fillers: Sequence[str]) -> str:
-    """Render one sentence: ``fillers`` are the NAME/CONCEPT values in left-to-right order."""
-    parts = STEP_TEMPLATES[template_id]
-    out: list[str] = []
-    fi = 0
-    for i, p in enumerate(parts):
-        if p == ART:
-            concept_val = fillers[_next_concept_filler_index(parts, i)]
-            out.append(_article(concept_val))
-        elif p in (NAME, CONCEPT):
-            out.append(fillers[fi])
-            fi += 1
-        else:
-            out.append(p)
-    return "".join(out)
+def parse_clause(sentence: str) -> Clause | None:
+    """Parse one PrOntoQA sentence into a :class:`Clause`, or None if it matches no form.
+
+    Predicate kind (concept vs property) is decided against the closed :data:`PROPERTY_WORDS`
+    set, so an article-less predicate is classified exactly.
+    """
+    s = sentence.strip()
+    # Order matters: try the article'd (concept) forms before the bare (property) forms.
+    m = _FACT_CONCEPT.match(s)
+    if m:
+        return Clause("fact", m.group(1), m.group(3), False, bool(m.group(2)))
+    m = _RULE_CONCEPT.match(s)
+    if m:
+        return Clause("rule", m.group(1), m.group(3), False, bool(m.group(2)))
+    m = _FACT_PROP.match(s)
+    if m and m.group(3) in PROPERTY_WORDS:
+        return Clause("fact", m.group(1), m.group(3), True, bool(m.group(2)))
+    m = _RULE_PROP.match(s)
+    if m and m.group(3) in PROPERTY_WORDS:
+        return Clause("rule", m.group(1), m.group(3), True, bool(m.group(2)))
+    m = _PLURAL.match(s)
+    if m:
+        subj = _singular_of(m.group(1).lower())
+        pred_raw = m.group(3)
+        if pred_raw in PROPERTY_WORDS:
+            return Clause("rule", subj, pred_raw, True, bool(m.group(2)))
+        return Clause("rule", subj, _singular_of(pred_raw), False, bool(m.group(2)))
+    return None
 
 
-def _template_regex(template_id: str) -> re.Pattern:
-    parts = STEP_TEMPLATES[template_id]
-    r = ["^"]
-    for p in parts:
-        if p == NAME:
-            r.append(r"([A-Z][a-zA-Z]*)")
-        elif p == CONCEPT:
-            r.append(r"([a-z][a-zA-Z]*)")
-        elif p == ART:
-            r.append(r"(?:a|an)")
-        else:
-            r.append(re.escape(p))
-    r.append("$")
-    return re.compile("".join(r))
+# --------------------------------------------------------------------------------------
+# Rendering (used by the checker's modus-ponens synthesis)
+# --------------------------------------------------------------------------------------
+def render_fact(entity: str, pred: str, is_property: bool, negated: bool) -> str:
+    """Render an entity fact in canonical singular form."""
+    neg = "not " if negated else ""
+    if is_property:
+        return f"{entity} is {neg}{pred}."
+    return f"{entity} is {neg}{_article(pred)} {pred}."
 
 
-_TEMPLATE_REGEXES = {tid: _template_regex(tid) for tid in STEP_TEMPLATES}
+def render_clause(c: "Clause") -> str:
+    """Render a parsed clause back to a canonical surface string (fact or Every-rule form)."""
+    if c.kind == "fact":
+        return render_fact(c.subject, c.pred, c.is_property, c.negated)
+    neg = "not " if c.negated else ""
+    if c.is_property:
+        return f"Every {c.subject} is {neg}{c.pred}."
+    return f"Every {c.subject} is {neg}{_article(c.pred)} {c.pred}."
 
 
-def _escape_terminal(s: str) -> str:
-    """Escape a string for a double-quoted GBNF/EBNF terminal."""
-    return s.replace("\\", "\\\\").replace('"', '\\"')
+def negate_sentence(sentence: str) -> str | None:
+    """Return the polarity-flipped version of a clause (for τ discrimination tests), or None."""
+    import dataclasses
+    c = parse_clause(sentence)
+    return None if c is None else render_clause(dataclasses.replace(c, negated=not c.negated))
 
 
-def _template_ebnf(template_id: str) -> str:
-    parts = STEP_TEMPLATES[template_id]
-    toks: list[str] = []
-    for p in parts:
-        if p == NAME:
-            toks.append("name")
-        elif p == CONCEPT:
-            toks.append("concept")
-        elif p == ART:
-            toks.append("article")
-        else:
-            toks.append(f'"{_escape_terminal(p)}"')
-    return " ".join(toks)
+def swap_concept(sentence: str, alt_concept: str) -> str | None:
+    """Replace a concept-membership clause's predicate with ``alt_concept`` (τ tests), or None.
+
+    Returns None for property clauses (a property swap is a different discrimination case).
+    """
+    import dataclasses
+    c = parse_clause(sentence)
+    if c is None or c.is_property:
+        return None
+    return render_clause(dataclasses.replace(c, pred=alt_concept))
 
 
 # --------------------------------------------------------------------------------------
 # EBNF builder
 # --------------------------------------------------------------------------------------
-def build_item_ebnf(entities: Sequence[str], concepts: Sequence[str]) -> str:
-    """Build a per-item EBNF (XGrammar/GBNF) over the item's vocabulary.
+def _esc(s: str) -> str:
+    return s.replace("\\", "\\\\").replace('"', '\\"')
 
-    Output is one-or-more reasoning steps (each a templatic sentence ending in a newline)
-    followed by a single ``The answer is True.``/``False.`` line. NAME/CONCEPT terminals are
-    drawn ONLY from ``entities``/``concepts``. Templates whose slots the vocabulary cannot
-    fill (e.g. NAME templates when there are no entities) are dropped. The root can complete
-    after the answer line, so XGrammar permits EOS there (rev #2).
+
+def _alt(words: Sequence[str]) -> str:
+    return " | ".join(f'"{_esc(w)}"' for w in words)
+
+
+def build_item_ebnf(
+    entities: Sequence[str], concepts: Sequence[str], properties: Sequence[str] = ()
+) -> str:
+    """Build a per-item EBNF (XGrammar/GBNF) over the item's concept + property vocabulary.
+
+    Output is one-or-more templatic reasoning steps (each ending in a newline) followed by a
+    ``The answer is True.``/``False.`` line. Terminals are drawn ONLY from the item's vocabulary.
+    Covers concept-membership and property predicates, singular (Name / Every / Each) and plural
+    subjects, positive and negated. The root can complete after the answer, so XGrammar permits
+    EOS there.
     """
-    if not concepts:
-        raise ValueError("cannot build grammar with empty concept vocabulary")
+    if not concepts and not properties:
+        raise ValueError("cannot build grammar with empty concept+property vocabulary")
 
+    concepts = list(dict.fromkeys(concepts))
+    properties = list(dict.fromkeys(properties))
     has_names = bool(entities)
-    usable = [
-        tid for tid in STEP_TEMPLATES
-        if has_names or NAME not in STEP_TEMPLATES[tid]
-    ]
-    if not usable:
-        raise ValueError("no usable step templates for this vocabulary")
+    has_prop = bool(properties)
 
-    step_alts = " | ".join(f"({_template_ebnf(tid)})" for tid in usable)
-    name_alts = " | ".join(f'"{_escape_terminal(e)}"' for e in entities) if has_names else '""'
-    concept_alts = " | ".join(f'"{_escape_terminal(c)}"' for c in concepts)
+    # predicate alternatives
+    pred_sing_alts = []
+    pred_plur_alts = []
+    if concepts:
+        pred_sing_alts.append('article " " concept')
+        pred_plur_alts.append("cplural_low")
+    if has_prop:
+        pred_sing_alts.append("property")
+        pred_plur_alts.append("property")
+    pred_sing = " | ".join(pred_sing_alts)
+    pred_plur = " | ".join(pred_plur_alts)
+
+    clause_alts = []
+    if has_names:
+        clause_alts.append('name " is " ("not ")? (' + pred_sing + ')')
+    if concepts:
+        clause_alts.append('("Every " | "Each ") concept " is " ("not ")? (' + pred_sing + ')')
+        clause_alts.append('cplural_cap " are " ("not ")? (' + pred_plur + ')')
+    clause = " | ".join(f"({c})" for c in clause_alts)
 
     lines = [
         "root ::= step+ answer",
-        'step ::= (' + step_alts + ') "\\n"',
-        'answer ::= "' + _escape_terminal(ANSWER_PREFIX) + '" ("True" | "False") "."',
-        "concept ::= " + concept_alts,
+        'step ::= (' + clause + ') "\\n"',
+        'answer ::= "' + _esc(ANSWER_PREFIX) + '" ("True" | "False") "."',
         'article ::= "a" | "an"',
     ]
+    if concepts:
+        lines.append("concept ::= " + _alt(concepts))
+        lines.append("cplural_low ::= " + _alt([plural_of(c) for c in concepts]))
+        lines.append("cplural_cap ::= " + _alt([plural_of(c).capitalize() for c in concepts]))
     if has_names:
-        lines.append("name ::= " + name_alts)
+        lines.append("name ::= " + _alt(entities))
+    if has_prop:
+        lines.append("property ::= " + _alt(properties))
     return "\n".join(lines) + "\n"
 
 
 # --------------------------------------------------------------------------------------
-# Pure-Python conformance check (mirrors the EBNF; used in tests + as a cheap gate)
+# Conformance check (mirrors the grammar; used in tests + exemplar validation)
 # --------------------------------------------------------------------------------------
-def _singular_set(concepts: Sequence[str]) -> set[str]:
-    return {c.lower() for c in concepts}
-
-
-def output_conforms(text: str, entities: Sequence[str], concepts: Sequence[str]) -> bool:
-    """True iff ``text`` is a valid grammar output: step lines then an answer line, with
-    every NAME/CONCEPT terminal present in the item's vocabulary.
+def output_conforms(
+    text: str, entities: Sequence[str], concepts: Sequence[str], properties: Sequence[str] = ()
+) -> bool:
+    """True iff ``text`` is valid grammar output: step lines then an answer line, every
+    terminal present in the item's vocabulary.
     """
     lines = [ln for ln in text.split("\n") if ln.strip()]
     if len(lines) < 2:
         return False
     *step_lines, answer_line = lines
-    if not ANSWER_RE.match(answer_line):
+    if not ANSWER_RE.match(answer_line) or not step_lines:
         return False
-    if not step_lines:
-        return False
-
-    ent_set = {e for e in entities}
-    con_set = _singular_set(concepts)
+    ent_set = set(entities)
+    con_set = {c.lower() for c in concepts}
+    prop_set = {p.lower() for p in properties}
     for ln in step_lines:
-        if not _line_matches_a_template(ln, ent_set, con_set):
+        c = parse_clause(ln)
+        if c is None:
+            return False
+        if c.kind == "fact" and c.subject not in ent_set:
+            return False
+        if c.kind == "rule" and c.subject not in con_set:
+            return False
+        if c.is_property and c.pred not in prop_set:
+            return False
+        if not c.is_property and c.pred not in con_set:
             return False
     return True
 
 
-def _line_matches_a_template(line: str, ent_set: set[str], con_set: set[str]) -> bool:
-    for tid, rx in _TEMPLATE_REGEXES.items():
-        m = rx.match(line)
-        if not m:
-            continue
-        # Group order follows the NAME/CONCEPT slot order in the template.
-        slot_types = [STEP_TEMPLATES[tid][i] for i in _slot_indices(STEP_TEMPLATES[tid])]
-        for val, typ in zip(m.groups(), slot_types):
-            if typ == NAME and val not in ent_set:
-                return False
-            if typ == CONCEPT and val.lower() not in con_set:
-                return False
-        return True
-    return False
-
-
 # --------------------------------------------------------------------------------------
-# Exemplar synthesis (from the SAME templates; dedicated item, never in a bucket -- R2 #2)
+# Exemplar synthesis (dedicated item, never in a bucket -- R2 #2)
 # --------------------------------------------------------------------------------------
-def _normalize_step(sentence: str) -> str:
-    """Parse a PrOntoQA chain sentence and re-render it in canonical template form.
-
-    Guarantees the exemplar conforms to the grammar regardless of upstream phrasing quirks
-    (article choice, spacing). Raises if the sentence matches no template.
-    """
-    s = sentence.strip()
-    for tid, rx in _TEMPLATE_REGEXES.items():
-        m = rx.match(s)
-        if m:
-            return render_template(tid, list(m.groups()))
-    raise ValueError(f"exemplar step matches no known template: {sentence!r}")
-
-
 def synthesize_exemplar_cot(exemplar_item) -> str:
-    """Build the few-shot CoT text for a dedicated exemplar item from the shared templates.
+    """Build the few-shot CoT for a dedicated exemplar item from its real gold steps.
 
     ``exemplar_item`` is an independent-ontology item that is NEVER placed in any bucket
-    (R2 #2) -- passing a test item here would leak its own reasoning chain into the prompt
-    and inflate accuracy for all methods. The returned text is grammar-conformant: normalized
-    step lines followed by the answer line.
+    (R2 #2). The gold steps are PrOntoQA's own output and are used verbatim (the grammar is
+    derived to match those forms), followed by the answer line. Raises if a step does not
+    conform to the exemplar's own grammar -- pick a different exemplar in that case.
     """
-    if not exemplar_item.gold_steps:
+    steps = list(exemplar_item.gold_steps)
+    if not steps:
         raise ValueError("exemplar item must carry gold_steps to synthesize a CoT")
-    steps = [_normalize_step(s) for s in exemplar_item.gold_steps]
+    props = getattr(exemplar_item, "properties", [])
+    for s in steps:
+        cot_line = s + "\nThe answer is True."  # per-line conformance harness
+        if not output_conforms(cot_line, exemplar_item.entities, exemplar_item.concepts, props):
+            raise ValueError(f"exemplar step does not conform to its grammar: {s!r}")
     answer = f"{ANSWER_PREFIX}{'True' if exemplar_item.gold else 'False'}."
-    return "".join(step + "\n" for step in steps) + answer
+    return "".join(s + "\n" for s in steps) + answer
 
 
 # --------------------------------------------------------------------------------------
@@ -252,5 +296,5 @@ def make_compiler(tokenizer, vocab_size: int):
 
 
 def compile_item_grammar(ebnf: str, compiler):
-    """Compile an EBNF string with a shared ``GrammarCompiler`` (compilation cache keys on the string)."""
+    """Compile an EBNF string with a shared ``GrammarCompiler`` (cache keys on the string)."""
     return compiler.compile_grammar(ebnf)

@@ -4,13 +4,14 @@ This module is CPU-only and importable without model weights. Token counting is 
 as a ``Callable[[str], int]`` so tests can run with a whitespace counter and Colab can
 pass the Llama tokenizer.
 
-The highest-uncertainty piece is :func:`raw_prontoqa_adapter`: the exact return shape of
-the upstream ``generate_question(...)`` is unknown until the repo is cloned, so the adapter
-detects the schema defensively and fails loud rather than silently coercing.
+:func:`raw_prontoqa_adapter` targets the VERIFIED upstream return shape (a 6-tuple; see the
+function docstring), with a dict/object fallback kept for defensiveness. Vocabulary isolation
+across items is guaranteed by per-item disjoint concept blocks (:func:`make_concept_names` /
+:func:`partition_blocks`), registered with the generator's morphology via the bridge.
 
-The sentence-boundary rule (:func:`split_sentences`) is defined ONCE here and reused by the
-checker and the grammar exemplar synthesizer so accuracy / step-boundary logic cannot
-silently diverge across modules.
+The sentence-boundary rule (:func:`split_sentences`) and the clause parser
+(``grammar.parse_clause``) are the single sources of truth reused across modules so accuracy /
+step-boundary / vocabulary logic cannot silently diverge.
 """
 from __future__ import annotations
 
@@ -20,6 +21,8 @@ import re
 import statistics
 from dataclasses import dataclass, field, asdict
 from typing import Any, Callable, Iterable, Sequence
+
+from . import grammar as gr
 
 CountTokens = Callable[[str], int]
 
@@ -52,85 +55,38 @@ def split_sentences(text: str) -> list[str]:
 
 
 # --------------------------------------------------------------------------------------
-# Vocabulary extraction from templatic sentences
+# Vocabulary extraction (via the shared grammar.parse_clause)
 # --------------------------------------------------------------------------------------
-# PrOntoQA sentence forms (fictional ontology), e.g.:
-#   "Wren is a tumpus."                    -> entity Wren, concept tumpus
-#   "Every tumpus is a wumpus."            -> concepts tumpus, wumpus
-#   "Tumpuses are wumpuses."               -> concepts (plural) tumpus, wumpus
-#   "Each wumpus is not a vumpus."         -> concepts wumpus, vumpus
-# Entities are capitalized proper names appearing as a sentence subject; concepts are the
-# lowercase class nouns. We extract conservatively via templates and normalize plurals.
-_ENTITY_RE = re.compile(r"^([A-Z][a-zA-Z]*)\s+is\s+(?:a|an)\b")
-_RULE_RE = re.compile(
-    r"^(?:Every|Each|All)\s+([a-z][a-zA-Z]*)\s+is\s+(?:not\s+)?(?:a|an)\s+([a-z][a-zA-Z]*)\b"
-)
-_PLURAL_RULE_RE = re.compile(r"^([A-Za-z][a-zA-Z]*)\s+are\s+(?:not\s+)?([A-Za-z][a-zA-Z]*)\b")
-_ENTITY_CONCEPT_RE = re.compile(
-    r"^([A-Z][a-zA-Z]*)\s+is\s+(?:not\s+)?(?:a|an)\s+([a-z][a-zA-Z]*)\b"
-)
+def extract_vocabulary(sentences: Sequence[str]) -> tuple[list[str], list[str], list[str]]:
+    """Return (entities, concepts, properties) drawn only from the given sentences.
 
-
-def _singularize(word: str) -> str:
-    """Plural->singular for templatic PrOntoQA nouns.
-
-    Fictional concepts are singular ``-us`` / plural ``-uses`` (tumpus / tumpuses). We must
-    NOT strip the ``s`` from an already-singular ``-us`` noun, so ``-us`` endings are held
-    fixed and only genuine plural suffixes are reduced.
-    """
-    w = word.lower()
-    if w.endswith("uses"):                       # tumpuses -> tumpus
-        return w[:-2]
-    if w.endswith("es") and w[:-2].endswith(("s", "x", "z", "ch", "sh")):
-        return w[:-2]                            # sibilant plurals: boxes -> box
-    if w.endswith("s") and not w.endswith(("us", "ss", "is", "as", "os")):
-        return w[:-1]                            # regular plural: cats -> cat
-    return w
-
-
-def extract_vocabulary(sentences: Sequence[str]) -> tuple[list[str], list[str]]:
-    """Return (entities, concepts) drawn only from the given sentences.
-
-    Entities are proper names (capitalized subjects); concepts are class nouns, normalized
-    to singular lowercase and de-duplicated while preserving first-seen order.
+    Uses the shared PrOntoQA clause parser so concept nouns and property adjectives are
+    separated exactly (properties classified against the fixed ``grammar.PROPERTY_WORDS``).
+    All lists are singular/lowercase (entities keep case), de-duplicated in first-seen order.
     """
     entities: list[str] = []
     concepts: list[str] = []
-    seen_e: set[str] = set()
-    seen_c: set[str] = set()
+    properties: list[str] = []
+    se, sc, sp = set(), set(), set()
 
-    def add_entity(name: str) -> None:
-        if name and name not in seen_e:
-            seen_e.add(name)
-            entities.append(name)
-
-    def add_concept(name: str) -> None:
-        s = _singularize(name)
-        if s and s not in seen_c:
-            seen_c.add(s)
-            concepts.append(s)
+    def add(lst, seen, val):
+        if val and val not in seen:
+            seen.add(val)
+            lst.append(val)
 
     for raw in sentences:
-        s = raw.strip()
-        m = _ENTITY_CONCEPT_RE.match(s)
-        if m:
-            add_entity(m.group(1))
-            add_concept(m.group(2))
+        c = gr.parse_clause(raw)
+        if c is None:
             continue
-        m = _RULE_RE.match(s)
-        if m:
-            add_concept(m.group(1))
-            add_concept(m.group(2))
-            continue
-        m = _PLURAL_RULE_RE.match(s)
-        if m:
-            add_concept(m.group(1))
-            add_concept(m.group(2))
-            continue
-        m = _ENTITY_RE.match(s)
-        if m:
-            add_entity(m.group(1))
-    return entities, concepts
+        if c.kind == "fact":
+            add(entities, se, c.subject)
+        else:  # rule: subject is the antecedent concept
+            add(concepts, sc, c.subject)
+        if c.is_property:
+            add(properties, sp, c.pred)
+        else:
+            add(concepts, sc, c.pred)
+    return entities, concepts, properties
 
 
 # --------------------------------------------------------------------------------------
@@ -153,6 +109,7 @@ class Item:
     gold: bool
     entities: list[str]
     concepts: list[str]
+    properties: list[str] = field(default_factory=list)
     gold_steps: list[str] = field(default_factory=list)
     n_hops: int = 0
     bucket: int | None = None
@@ -205,49 +162,64 @@ def _first_present(d: dict, keys: Sequence[str]) -> Any:
     return None
 
 
-def raw_prontoqa_adapter(raw: Any, item_id: str, base_id: str | None = None) -> Item:
-    """Normalize one upstream ``generate_question`` return value into an :class:`Item`.
+_QUERY_PREFIX_RE = re.compile(r"^(?:True or false:|Prove:)\s*", re.IGNORECASE)
 
-    Tolerates three shapes and fails loudly on anything else:
-      * dict: keys among {context/question_text/facts, query/question, answer/label/gold,
-        chain_of_thought/proof/steps/gold_steps}.
-      * tuple/list: (context, query, answer[, chain]).
-      * object: attributes with the same names as the dict keys.
 
-    Does NOT assume gold is a bool, and does NOT assume context is pre-split.
+class GenerationFailed(Exception):
+    """Raised when PrOntoQA's generate_question returned an all-None failure tuple."""
+
+
+def raw_prontoqa_adapter(raw: Any, item_id: str, base_id: str | None = None,
+                         *, concepts_hint: Sequence[str] | None = None) -> Item:
+    """Normalize one ``generate_question`` return value into an :class:`Item`.
+
+    The upstream API (verified from the pinned source, run_experiment.py line 664) returns a
+    6-tuple::
+
+        (question_text, query, formulas+premises, chain_of_thought, str(answer), linearized_proof)
+
+    where ``question_text`` is the context as one string blob, ``query`` is prefixed with
+    ``"True or false: "``, element 2 is logical-form objects (NOT the answer), ``chain_of_thought``
+    is a list of step strings, and the answer is ``"True"``/``"False"`` (a STRING, not a bool).
+    On generation failure PrOntoQA returns ``(None,)*6``; we raise :class:`GenerationFailed` so the
+    caller can retry (its documented usage). A dict/object form is still accepted defensively.
+
+    ``concepts_hint`` (the disjoint block the item was generated from) augments the vocabulary
+    extracted from text, ensuring the grammar covers every block concept even if a given item's
+    context happened not to use all of them.
     """
     base_id = base_id or item_id
 
-    context_val = query_val = gold_val = steps_val = None
-
-    if isinstance(raw, dict):
-        context_val = _first_present(raw, ["context", "question_text", "facts", "premises", "theory"])
-        query_val = _first_present(raw, ["query", "question", "goal", "hypothesis"])
-        gold_val = _first_present(raw, ["answer", "label", "gold", "target"])
+    if isinstance(raw, (tuple, list)):
+        if len(raw) == 6:
+            question_text, query, _forms, chain, answer, _proof = raw
+        elif len(raw) >= 4:  # tolerate a (context, query, answer, chain) shape defensively
+            question_text, query, answer, chain = raw[0], raw[1], raw[2], raw[3]
+        else:
+            raise ValueError(f"unexpected tuple arity {len(raw)} for item {item_id!r}")
+        if question_text is None or query is None or answer is None:
+            raise GenerationFailed(f"generate_question failed (all-None) for item {item_id!r}")
+        context_val, query_val, gold_val, steps_val = question_text, query, answer, chain
+    elif isinstance(raw, dict):
+        context_val = _first_present(raw, ["question_text", "context", "facts", "premises"])
+        query_val = _first_present(raw, ["query", "question", "goal"])
+        gold_val = _first_present(raw, ["answer", "label", "gold"])
         steps_val = _first_present(raw, ["chain_of_thought", "proof", "steps", "gold_steps", "chain"])
-    elif isinstance(raw, (tuple, list)):
-        if len(raw) < 3:
-            raise ValueError(f"tuple form must be (context, query, answer[, chain]); got len {len(raw)}")
-        context_val, query_val, gold_val = raw[0], raw[1], raw[2]
-        steps_val = raw[3] if len(raw) > 3 else None
+        if context_val is None or query_val is None or gold_val is None:
+            raise ValueError(f"dict adapter missing context/query/answer for {item_id!r}: keys {list(raw)}")
     else:  # object with attributes
-        get = lambda names: next(
-            (getattr(raw, n) for n in names if getattr(raw, n, None) is not None), None
-        )
-        context_val = get(["context", "question_text", "facts", "premises", "theory"])
-        query_val = get(["query", "question", "goal", "hypothesis"])
-        gold_val = get(["answer", "label", "gold", "target"])
-        steps_val = get(["chain_of_thought", "proof", "steps", "gold_steps", "chain"])
-
-    if context_val is None or query_val is None or gold_val is None:
-        raise ValueError(
-            f"Adapter could not locate context/query/answer in raw item {item_id!r}. "
-            f"Got keys/type: {list(raw.keys()) if isinstance(raw, dict) else type(raw).__name__}"
-        )
+        get = lambda names: next((getattr(raw, n) for n in names if getattr(raw, n, None) is not None), None)
+        context_val = get(["question_text", "context", "facts"])
+        query_val = get(["query", "question", "goal"])
+        gold_val = get(["answer", "label", "gold"])
+        steps_val = get(["chain_of_thought", "proof", "steps", "chain"])
+        if context_val is None or query_val is None or gold_val is None:
+            raise ValueError(f"object adapter missing context/query/answer for {item_id!r}")
 
     context = _as_sentence_list(context_val)
-    # The query may itself be a blob; keep it as a single sentence string.
-    query_sentences = _as_sentence_list(query_val)
+    # Strip the "True or false: " / "Prove: " prefix, keep the statement sentence.
+    query_str = _QUERY_PREFIX_RE.sub("", str(query_val).strip())
+    query_sentences = split_sentences(query_str)
     if not query_sentences:
         raise ValueError(f"Empty query for item {item_id!r}")
     question = " ".join(query_sentences)
@@ -255,8 +227,14 @@ def raw_prontoqa_adapter(raw: Any, item_id: str, base_id: str | None = None) -> 
     gold = _normalize_gold(gold_val)
     gold_steps = _as_sentence_list(steps_val) if steps_val is not None else []
 
-    # Vocabulary is extracted from context AND query so grammar terminals cover the query.
-    entities, concepts = extract_vocabulary(list(context) + query_sentences)
+    # Vocabulary from context + query; augment concepts with the generation block if provided.
+    entities, concepts, properties = extract_vocabulary(list(context) + query_sentences)
+    if concepts_hint:
+        seen = set(concepts)
+        for c in concepts_hint:
+            if c not in seen:
+                seen.add(c)
+                concepts.append(c)
 
     return Item(
         item_id=item_id,
@@ -266,6 +244,7 @@ def raw_prontoqa_adapter(raw: Any, item_id: str, base_id: str | None = None) -> 
         gold=gold,
         entities=entities,
         concepts=concepts,
+        properties=properties,
         gold_steps=gold_steps,
         n_hops=len(gold_steps),
     )
@@ -295,7 +274,14 @@ def build_distractor_pool(
 
 
 def _names_in(item: Item) -> set[str]:
-    """Lowercased entity + concept names of an item, for collision detection."""
+    """Lowercased entity + CONCEPT names of an item, for collision detection.
+
+    Properties are DELIBERATELY excluded: PrOntoQA's ~46 property adjectives are shared by
+    every item, so including them would make every distractor "collide" and drop the whole
+    pool. Concept disjointness (guaranteed by per-item disjoint concept blocks) is what keeps
+    injected distractors inert; a distractor mentioning the base entity is also dropped, so a
+    property-sharing distractor can only chain to a non-base entity and stays inert.
+    """
     names = {e.lower() for e in item.entities}
     names |= {c.lower() for c in item.concepts}
     return names
@@ -309,7 +295,7 @@ def filter_colliding(pool: Sequence[str], base: Item) -> list[str]:
     base_names = _names_in(base)
     kept: list[str] = []
     for s in pool:
-        ents, cons = extract_vocabulary([s])
+        ents, cons, _props = extract_vocabulary([s])
         s_names = {n.lower() for n in ents} | {n.lower() for n in cons}
         if s_names.isdisjoint(base_names):
             kept.append(s)
@@ -369,6 +355,7 @@ def bucket_one_item(
         gold=base.gold,
         entities=base.entities,
         concepts=base.concepts,
+        properties=base.properties,
         gold_steps=base.gold_steps,
         n_hops=base.n_hops,
         bucket=bucket,
@@ -500,3 +487,69 @@ def write_manifest(
 def hf_token_counter(tokenizer) -> CountTokens:
     """Wrap an HF tokenizer into a ``count_tokens`` callable (no special tokens)."""
     return lambda text: len(tokenizer.encode(text, add_special_tokens=False))
+
+
+def load_items(path: str) -> list[Item]:
+    """Reload items from a JSONL file written by Phase 1 (for resumable later phases)."""
+    out: list[Item] = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                out.append(Item(**json.loads(line)))
+    return out
+
+
+# --------------------------------------------------------------------------------------
+# Disjoint synthetic concept vocabulary (vocabulary isolation -- see module + RUNBOOK)
+# --------------------------------------------------------------------------------------
+# PrOntoQA ships only ~90 disjoint concept names (9 blocks of 10). We need one disjoint block
+# per base item AND a disjoint pool space, far more than that, so we synthesize novel nonsense
+# nouns in the same "*pus"-style morphology (lowercase, end in a consonant + "us"; pluralize by
+# +"es"). Each must be registered with PrOntoQA's morphology before use (add_noun), and must
+# avoid the generator's reserved nouns. Blocks are pairwise disjoint so no distractor can share
+# a concept with any base item -- the load-bearing invariant for the collision filter.
+_SYNTH_ONSETS = [
+    "bl", "cl", "dr", "fl", "gl", "gr", "kr", "pl", "pr", "sl", "sm", "sn", "sp", "st", "str",
+    "sw", "tr", "thr", "vl", "zr", "b", "d", "f", "g", "h", "j", "k", "l", "m", "n", "p", "r",
+    "s", "t", "v", "w", "z", "ch", "sh", "zh", "br", "cr", "fr",
+]
+_SYNTH_NUCLEI = [
+    "om", "im", "um", "am", "em", "or", "ar", "ur", "er", "ir", "ol", "al", "ul", "il", "el",
+    "un", "in", "on", "an", "en",
+]
+_SYNTH_CODAS = ["pus", "mpus", "rpus", "lpus", "npus", "spus", "tpus", "dpus", "kpus", "gpus",
+                "bpus", "zpus"]
+
+
+def make_concept_names(n: int, seed: int, reserved: Iterable[str] = ()) -> list[str]:
+    """Generate ``n`` novel PrOntoQA-style concept nouns, avoiding ``reserved`` names."""
+    reserved = set(reserved)
+    combos = [o + nu + co for o in _SYNTH_ONSETS for nu in _SYNTH_NUCLEI for co in _SYNTH_CODAS]
+    random.Random(seed).shuffle(combos)
+    out, seen = [], set()
+    for name in combos:
+        if name in reserved or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+        if len(out) >= n:
+            break
+    if len(out) < n:
+        raise ValueError(f"could only synthesize {len(out)} novel names, need {n}; widen the morphology")
+    return out
+
+
+def partition_blocks(names: Sequence[str], block_size: int) -> list[list[str]]:
+    """Split a flat name list into pairwise-disjoint blocks of ``block_size``."""
+    return [list(names[i:i + block_size]) for i in range(0, len(names) - block_size + 1, block_size)]
+
+
+def register_concepts(morphology, names: Iterable[str]) -> None:
+    """Register synthetic concept nouns (singular -> +'es' plural) with PrOntoQA's morphology.
+
+    Skips names already present so it is safe to call repeatedly / on reconnect.
+    """
+    for name in names:
+        if not morphology.is_noun(name):
+            morphology.add_noun(name, gr.plural_of(name))

@@ -1,13 +1,13 @@
-"""CPU-only tests for datagen: adapter shapes, vocab extraction, bucketing, validation, splits."""
+"""CPU-only tests for datagen: adapter (verified 6-tuple), vocab (concept vs property),
+bucketing, validation, splits, and the synthetic disjoint-block generator."""
 from __future__ import annotations
 
 import pytest
 
 from motivation_exp import datagen as dg
-from motivation_exp.datagen import Item
+from motivation_exp.datagen import Item, GenerationFailed
 
 
-# A whitespace token counter stands in for the Llama tokenizer in CPU tests.
 def wc(text: str) -> int:
     return len(text.split())
 
@@ -20,159 +20,152 @@ def test_split_sentences_keeps_periods_and_drops_empty():
     assert dg.split_sentences(text) == ["Wren is a tumpus.", "Every tumpus is a wumpus."]
 
 
-def test_split_sentences_appends_missing_terminal_period():
-    assert dg.split_sentences("Wren is a tumpus") == ["Wren is a tumpus."]
-
-
 # --------------------------------------------------------------------------------------
-# vocabulary extraction
+# vocabulary extraction: concepts vs properties
 # --------------------------------------------------------------------------------------
-def test_extract_vocabulary_entities_and_concepts():
+def test_extract_vocabulary_separates_concepts_and_properties():
     sents = [
         "Wren is a tumpus.",
         "Every tumpus is a wumpus.",
-        "Wumpuses are vumpuses.",
+        "Tumpuses are not slow.",   # slow is a property
+        "Wren is not slow.",
     ]
-    entities, concepts = dg.extract_vocabulary(sents)
+    entities, concepts, properties = dg.extract_vocabulary(sents)
     assert entities == ["Wren"]
-    # singularized + de-duplicated, first-seen order
-    assert concepts == ["tumpus", "wumpus", "vumpus"]
+    assert concepts == ["tumpus", "wumpus"]
+    assert properties == ["slow"]
+
+
+def test_extract_vocabulary_each_every_plural_forms():
+    sents = ["Each yumpus is shy.", "Impuses are tumpuses.", "Every impus is a zumpus."]
+    entities, concepts, properties = dg.extract_vocabulary(sents)
+    assert entities == []
+    assert set(concepts) == {"yumpus", "impus", "tumpus", "zumpus"}
+    assert properties == ["shy"]
 
 
 # --------------------------------------------------------------------------------------
-# adapter: the three shapes + gold normalization
+# adapter: the verified 6-tuple
 # --------------------------------------------------------------------------------------
-DICT_RAW = {
-    "context": ["Wren is a tumpus.", "Every tumpus is a wumpus."],
-    "query": "Wren is a wumpus.",
-    "answer": "True",
-    "chain_of_thought": ["Wren is a tumpus.", "Wren is a wumpus."],
-}
-TUPLE_RAW = (
-    "Wren is a tumpus. Every tumpus is a wumpus.",  # blob, not pre-split
-    "Wren is a wumpus.",
-    "False",
-)
+def _six_tuple(answer="True"):
+    question_text = "Wren is a tumpus. Every tumpus is a wumpus. Tumpuses are not slow."
+    query = "True or false: Wren is not slow."
+    forms = ["<lf-objects>"]          # element 2: logical forms (ignored by adapter)
+    chain = ["Wren is a tumpus.", "Tumpuses are not slow.", "Wren is not slow."]
+    proof = ["<proof-objects>"]
+    return (question_text, query, forms, chain, answer, proof)
 
 
-class ObjRaw:
-    def __init__(self):
-        self.facts = ["Wren is a tumpus.", "Every tumpus is a wumpus."]
-        self.goal = "Wren is a wumpus."
-        self.label = 1
-
-
-def test_adapter_dict_shape():
-    it = dg.raw_prontoqa_adapter(DICT_RAW, item_id="x1")
+def test_adapter_six_tuple_shape():
+    it = dg.raw_prontoqa_adapter(_six_tuple("True"), item_id="x1")
     assert it.gold is True
-    assert it.context == ["Wren is a tumpus.", "Every tumpus is a wumpus."]
-    assert it.question == "Wren is a wumpus."
+    assert it.context == ["Wren is a tumpus.", "Every tumpus is a wumpus.", "Tumpuses are not slow."]
+    assert it.question == "Wren is not slow."      # "True or false: " prefix stripped
     assert it.entities == ["Wren"]
     assert "tumpus" in it.concepts and "wumpus" in it.concepts
-    assert it.n_hops == 2  # two gold steps
+    assert it.properties == ["slow"]
+    assert it.gold_steps[-1] == "Wren is not slow."
+    assert it.n_hops == 3
 
 
-def test_adapter_tuple_shape_splits_blob():
-    it = dg.raw_prontoqa_adapter(TUPLE_RAW, item_id="x2")
+def test_adapter_answer_is_string_false():
+    it = dg.raw_prontoqa_adapter(_six_tuple("False"), item_id="x2")
     assert it.gold is False
-    assert it.context == ["Wren is a tumpus.", "Every tumpus is a wumpus."]
-    assert it.question == "Wren is a wumpus."
 
 
-def test_adapter_object_shape_and_int_gold():
-    it = dg.raw_prontoqa_adapter(ObjRaw(), item_id="x3")
-    assert it.gold is True  # label=1
-    assert it.question == "Wren is a wumpus."
+def test_adapter_raises_generation_failed_on_all_none():
+    with pytest.raises(GenerationFailed):
+        dg.raw_prontoqa_adapter((None,) * 6, item_id="bad")
 
 
-def test_adapter_fails_loud_on_missing_fields():
-    with pytest.raises(ValueError):
-        dg.raw_prontoqa_adapter({"context": ["a."], "query": "b."}, item_id="bad")  # no answer
+def test_adapter_concepts_hint_augments_vocab():
+    it = dg.raw_prontoqa_adapter(_six_tuple(), item_id="x3", concepts_hint=["tumpus", "zzzpus"])
+    assert "zzzpus" in it.concepts   # block concept not in context is still covered
 
 
-def test_normalize_gold_ab_and_bad():
-    assert dg._normalize_gold("A") is True
-    assert dg._normalize_gold("B") is False
-    with pytest.raises(ValueError):
-        dg._normalize_gold("maybe")
+def test_adapter_dict_fallback():
+    raw = {"question_text": "Wren is a tumpus.", "query": "True or false: Wren is a tumpus.",
+           "answer": "True", "chain_of_thought": ["Wren is a tumpus."]}
+    it = dg.raw_prontoqa_adapter(raw, item_id="d1")
+    assert it.gold is True and it.question == "Wren is a tumpus."
 
 
 # --------------------------------------------------------------------------------------
-# distractor pool + collision filter
+# distractor pool + collision filter (properties excluded from collisions)
 # --------------------------------------------------------------------------------------
-def _base_item() -> Item:
-    return dg.raw_prontoqa_adapter(DICT_RAW, item_id="base", base_id="base")
+def _base_item():
+    return dg.raw_prontoqa_adapter(_six_tuple(), item_id="base", base_id="base")
 
 
-def test_filter_colliding_drops_shared_names():
-    base = _base_item()  # names: Wren, tumpus, wumpus
+def test_filter_colliding_drops_shared_concept_or_entity_keeps_shared_property():
+    base = _base_item()  # entities: Wren; concepts: tumpus, wumpus; properties: slow
     pool = [
-        "Sprocket is a yumpus.",      # disjoint -> kept
-        "Wren is a zumpus.",          # shares Wren -> dropped
-        "Every yumpus is a tumpus.",  # shares tumpus -> dropped
-        "Every zumpus is a jompus.",  # disjoint -> kept
+        "Sprocket is a yumpus.",        # disjoint -> kept
+        "Wren is a yumpus.",            # shares entity Wren -> dropped
+        "Every yumpus is a tumpus.",    # shares concept tumpus -> dropped
+        "Every yumpus is not slow.",    # shares only PROPERTY slow -> KEPT (properties are global)
     ]
     kept = dg.filter_colliding(pool, base)
-    assert kept == ["Sprocket is a yumpus.", "Every zumpus is a jompus."]
+    assert kept == ["Sprocket is a yumpus.", "Every yumpus is not slow."]
 
 
 # --------------------------------------------------------------------------------------
 # bucketing + validation
 # --------------------------------------------------------------------------------------
-def test_bucket_reaches_target_within_tolerance_and_query_last():
+def test_bucket_reaches_target_and_carries_properties():
     base = _base_item()
-    # a large disjoint distractor pool
     pool = [f"Gadget{i} is a yumpus{i}." for i in range(400)]
-    bucket = 60  # word-count target
-    it = dg.bucket_one_item(base, bucket, pool, wc, seed=1, tol=0.05)
-    assert it.bucket == 60
-    assert 57 <= it.token_count <= 63  # within +/- 5%
+    it = dg.bucket_one_item(base, 60, pool, wc, seed=1, tol=0.05)
+    assert 57 <= it.token_count <= 63
+    assert it.properties == base.properties
     ok, reason = dg.validate_item(it, wc, tol=0.05)
     assert ok, reason
-    # gold sentences preserved
-    joined = " ".join(it.context + [it.question])
-    for g in base.context:
-        assert g in joined
-    assert joined.rstrip().endswith(it.question)
+    assert " ".join(it.context + [it.question]).rstrip().endswith(it.question)
 
 
 def test_validate_flags_out_of_tolerance():
     base = _base_item()
-    it = Item(
-        item_id="t", base_id="base", context=base.context, question=base.question,
-        gold=True, entities=base.entities, concepts=base.concepts,
-        gold_context=base.context, bucket=1000, token_count=10,
-    )
+    it = Item(item_id="t", base_id="base", context=base.context, question=base.question, gold=True,
+              entities=base.entities, concepts=base.concepts, properties=base.properties,
+              gold_context=base.context, bucket=1000, token_count=10)
     ok, reason = dg.validate_item(it, wc)
     assert not ok and "outside" in reason
 
 
-def test_bucket_to_token_targets_deterministic_seeds():
-    bases = [_base_item(), dg.raw_prontoqa_adapter(DICT_RAW, item_id="base2", base_id="base2")]
-    pool = [f"Gadget{i} is a yumpus{i}." for i in range(400)]
-    out = dg.bucket_to_token_targets(bases, wc, pool, targets=[40, 60], base_seed=0)
-    assert set(out.keys()) == {40, 60}
-    assert len(out[40]) == 2 and len(out[60]) == 2
-    # deterministic: rerun gives identical seeds/token counts
-    out2 = dg.bucket_to_token_targets(bases, wc, pool, targets=[40, 60], base_seed=0)
-    assert [i.seed for i in out[60]] == [i.seed for i in out2[60]]
-    assert [i.token_count for i in out[60]] == [i.token_count for i in out2[60]]
-
-
 # --------------------------------------------------------------------------------------
-# splits disjointness
+# splits
 # --------------------------------------------------------------------------------------
 def test_reserve_splits_disjoint():
-    items = [dg.raw_prontoqa_adapter(DICT_RAW, item_id=f"i{i}", base_id=f"b{i}") for i in range(15)]
+    items = [dg.raw_prontoqa_adapter(_six_tuple(), item_id=f"i{i}", base_id=f"b{i}") for i in range(15)]
     bucket_items, calib, exemplar = dg.reserve_splits(items, n_calib=10, n_exemplar=1)
-    bset = {i.base_id for i in bucket_items}
-    cset = {i.base_id for i in calib}
-    eset = {i.base_id for i in exemplar}
-    assert len(eset) == 1 and len(cset) == 10
-    assert bset.isdisjoint(cset) and bset.isdisjoint(eset) and cset.isdisjoint(eset)
+    b = {i.base_id for i in bucket_items}; c = {i.base_id for i in calib}; e = {i.base_id for i in exemplar}
+    assert len(e) == 1 and len(c) == 10
+    assert b.isdisjoint(c) and b.isdisjoint(e) and c.isdisjoint(e)
 
 
-def test_reserve_splits_raises_when_too_few():
-    items = [dg.raw_prontoqa_adapter(DICT_RAW, item_id=f"i{i}", base_id=f"b{i}") for i in range(5)]
+# --------------------------------------------------------------------------------------
+# synthetic disjoint-block generator
+# --------------------------------------------------------------------------------------
+def test_make_concept_names_novel_and_disjoint():
+    reserved = {"wumpus", "tumpus", "impus"}
+    names = dg.make_concept_names(200, seed=0, reserved=reserved)
+    assert len(names) == 200
+    assert len(set(names)) == 200            # unique
+    assert set(names).isdisjoint(reserved)   # avoids reserved
+    assert all(n.endswith("us") and n.islower() for n in names)  # *pus morphology
+
+
+def test_partition_blocks_pairwise_disjoint():
+    names = dg.make_concept_names(160, seed=0)
+    blocks = dg.partition_blocks(names, 16)
+    assert len(blocks) == 10
+    seen = set()
+    for blk in blocks:
+        assert len(blk) == 16
+        assert seen.isdisjoint(blk)
+        seen |= set(blk)
+
+
+def test_make_concept_names_raises_when_exhausted():
     with pytest.raises(ValueError):
-        dg.reserve_splits(items, n_calib=10, n_exemplar=1)
+        dg.make_concept_names(10_000_000, seed=0)

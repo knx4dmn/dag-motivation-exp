@@ -60,13 +60,22 @@ BUCKETS = [512, 1024, 2048, 4096, 8192]  # target prompt token counts (tokenizer
 BUCKET_TOL = 0.05                        # +/- 5 percent of target
 METHODS = ["unguided", "symbolic", "semantic"]
 
-N_HOPS = 3               # num_deduction_steps; held constant across all buckets
+N_HOPS = 3               # num_deduction_steps (includes the axiom step); held constant
 ONTOLOGY = "fictional"   # prevents world-knowledge shortcuts
+DEDUCTION_RULE = "ModusPonens"
+DISTRACTORS = "relevant"
+NO_ADJECTIVES = True     # drop decorative adjective sentences -> cleaner proofs (conclusion stays property-based)
+CONCEPT_BLOCK_SIZE = 16  # concepts per disjoint per-item block (validated success rate on T4-free gen)
 
 PILOT_ITEMS_PER_BUCKET = 20
 FULL_ITEMS_PER_BUCKET = 100
 N_CALIB_ITEMS = 10       # held-out for Phase 1.5 tau sweep (disjoint from pilot + full)
 N_EXEMPLAR_ITEMS = 1     # few-shot exemplar(s); independent ontology, never in a bucket
+# Base questions to generate = full/bucket + spares (that fail validation) + calib + exemplar.
+# Each base item gets its own disjoint concept block; pool items draw from a further-disjoint
+# block range, so every distractor is concept-disjoint from every base item.
+N_BASE_ITEMS = 150
+N_POOL_ITEMS = 300       # independent ontologies harvested for the distractor pool
 
 # --------------------------------------------------------------------------------------
 # Decoding (plan section 4)
@@ -95,6 +104,11 @@ PER_STEP_TOKEN_CAP = 48                  # force a boundary if no period within 
 TAU_RESTATE: float | None = None   # cosine >= this => step restates a context fact/rule
 TAU_MP: float | None = None        # cosine >= this => valid modus-ponens continuation
 TAU_GRID = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]  # swept in Phase 1.5
+# Exact polarity/predicate match on the cosine-retrieved winner. Required because bge-small
+# cannot separate "X is slow"/"X is not slow" or distinct novel *pus concepts (verified in
+# Phase 1.5). It verifies the associative-match winner; it does NOT replace the full-candidate
+# similarity search (the O(context) op Panel B measures / CAM maps to). Keep ON for reported runs.
+PREDICATE_GUARD = True
 
 # --------------------------------------------------------------------------------------
 # RNG seeds

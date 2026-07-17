@@ -16,20 +16,14 @@ and Colab wraps ``BAAI/bge-small-en-v1.5`` (see :func:`sentence_transformer_enco
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from typing import Callable, Sequence
 
 import numpy as np
 
 from . import grammar as gr
-from .datagen import _singularize
 
 EncodeFn = Callable[[Sequence[str]], np.ndarray]
-
-# Plural rule form ("Tumpuses are wumpuses.") is not one of the generation templates but
-# can appear in context; parse it here for modus-ponens synthesis.
-_PLURAL_RULE_RE = re.compile(r"^([A-Za-z][a-zA-Z]*)\s+are\s+(not\s+)?([A-Za-z][a-zA-Z]*)\.?$")
 
 
 @dataclass
@@ -42,30 +36,6 @@ class CheckResult:
     kind: str | None       # "restate" | "mp" | None
 
 
-# --------------------------------------------------------------------------------------
-# Sentence parsing (structured triples for modus-ponens synthesis)
-# --------------------------------------------------------------------------------------
-def _parse_sentence(sentence: str) -> tuple | None:
-    """Return ('fact', entity, concept, negated) or ('rule', ante, cons, negated) or None."""
-    s = sentence.strip()
-    m = gr._TEMPLATE_REGEXES["entity_pos"].match(s)
-    if m:
-        return ("fact", m.group(1), _singularize(m.group(2)), False)
-    m = gr._TEMPLATE_REGEXES["entity_neg"].match(s)
-    if m:
-        return ("fact", m.group(1), _singularize(m.group(2)), True)
-    m = gr._TEMPLATE_REGEXES["rule_pos"].match(s)
-    if m:
-        return ("rule", _singularize(m.group(1)), _singularize(m.group(2)), False)
-    m = gr._TEMPLATE_REGEXES["rule_neg"].match(s)
-    if m:
-        return ("rule", _singularize(m.group(1)), _singularize(m.group(2)), True)
-    m = _PLURAL_RULE_RE.match(s)
-    if m:
-        return ("rule", _singularize(m.group(1)), _singularize(m.group(3)), bool(m.group(2)))
-    return None
-
-
 class SemanticChecker:
     """Per-item semantic verifier holding the embedder and the growing candidate set."""
 
@@ -74,21 +44,30 @@ class SemanticChecker:
         encode_fn: EncodeFn,
         tau_restate: float,
         tau_mp: float,
+        predicate_guard: bool = True,
     ) -> None:
         if tau_restate is None or tau_mp is None:
             raise ValueError("tau thresholds must be calibrated (not None) before checking")
         self.encode_fn = encode_fn
         self.tau_restate = float(tau_restate)
         self.tau_mp = float(tau_mp)
+        # bge-small cannot reliably separate "X is slow" from "X is not slow", nor one novel
+        # *pus concept from another (cosine > 0.9 for both). The guard requires the parsed
+        # clause of the cosine-retrieved match to EQUAL the step's parsed clause (same subject,
+        # predicate, is_property, polarity) -- it verifies the associative-match winner, it does
+        # NOT replace the similarity search (which still runs over the full candidate set every
+        # step -- the O(context) operation Panel B measures and CAM maps to). Paraphrases still
+        # pass because they parse to the same Clause. Calibrate/verify in Phase 1.5.
+        self.predicate_guard = bool(predicate_guard)
 
         # candidate set (restate target): context sentences + accepted steps
         self._cand_texts: list[str] = []
         self._cand_embs: np.ndarray | None = None  # shape [n, d], L2-normalized
 
         # structured knowledge for modus-ponens synthesis
-        self._rules: list[tuple[str, str, bool]] = []          # (ante, cons, negated)
-        self._frontier: set[tuple[str, str, bool]] = set()     # (entity, concept, negated) facts
-        self._expected_cache: dict[str, np.ndarray] = {}       # expected-string -> emb row
+        self._rules: list[tuple[str, str, bool, bool]] = []  # (ante_concept, cons, cons_is_property, negated)
+        self._frontier: set[tuple[str, str]] = set()         # (entity, concept) non-negated membership facts
+        self._expected_cache: dict[str, np.ndarray] = {}     # expected-string -> emb row
 
     # ---- setup --------------------------------------------------------------------
     def prefill(self, context: Sequence[str]) -> None:
@@ -100,13 +79,18 @@ class SemanticChecker:
         self._cand_texts = list(texts)
         self._cand_embs = self._embed(texts) if texts else None
         for s in texts:
-            parsed = _parse_sentence(s)
-            if parsed is None:
-                continue
-            if parsed[0] == "rule":
-                self._rules.append((parsed[1], parsed[2], parsed[3]))
-            else:  # seed frontier with initial entity facts
-                self._frontier.add((parsed[1], parsed[2], parsed[3]))
+            self._ingest(s)
+
+    def _ingest(self, sentence: str) -> None:
+        """Update the rule set / fact frontier from one parsed clause."""
+        c = gr.parse_clause(sentence)
+        if c is None:
+            return
+        if c.kind == "rule":
+            self._rules.append((c.subject, c.pred, c.is_property, c.negated))
+        elif not c.is_property and not c.negated:
+            # only non-negated concept-membership facts drive forward chaining
+            self._frontier.add((c.subject, c.pred))
 
     # ---- per-step check -----------------------------------------------------------
     def check_step(self, step_text: str) -> CheckResult:
@@ -116,29 +100,59 @@ class SemanticChecker:
             return CheckResult(False, 0.0, None, None)
 
         emb = self._embed([step_text])[0]  # [d]
+        step_clause = gr.parse_clause(step_text)
 
-        # (a) restate: cosine vs all context sentences + accepted steps
+        # (a) restate: associative cosine match over the FULL candidate set (context + accepted
+        #     steps). This full-set similarity search is the mechanism -- it always runs, and its
+        #     cost grows with the bucket (Panel B / CAM). The guard only VERIFIES the winner.
         sims = self._cand_embs @ emb
-        j = int(np.argmax(sims))
-        cos_restate = float(sims[j])
-        if cos_restate >= self.tau_restate:
-            return CheckResult(True, cos_restate, self._cand_texts[j], "restate")
+        j_best = int(np.argmax(sims))
+        cos_restate = float(sims[j_best])
+        above = np.nonzero(sims >= self.tau_restate)[0]
+        rj = self._guarded_pick(above, sims, step_clause,
+                                lambda k: gr.parse_clause(self._cand_texts[k]))
+        if rj is not None:
+            return CheckResult(True, float(sims[rj]), self._cand_texts[rj], "restate")
 
-        # (b) modus-ponens: cosine vs synthesized expected-next-step strings
+        # (b) modus-ponens: cosine vs synthesized expected-next-step strings (guarded likewise).
         expected = self._synthesize_expected()
         cos_mp, matched_mp = 0.0, None
         if expected:
             exp_embs = np.stack([self._expected_emb(e) for e in expected])
             mp_sims = exp_embs @ emb
-            i = int(np.argmax(mp_sims))
-            cos_mp, matched_mp = float(mp_sims[i]), expected[i]
-            if cos_mp >= self.tau_mp:
-                return CheckResult(True, cos_mp, matched_mp, "mp")
+            i_best = int(np.argmax(mp_sims))
+            cos_mp, matched_mp = float(mp_sims[i_best]), expected[i_best]
+            above_mp = np.nonzero(mp_sims >= self.tau_mp)[0]
+            mi = self._guarded_pick(above_mp, mp_sims, step_clause, lambda k: gr.parse_clause(expected[k]))
+            if mi is not None:
+                return CheckResult(True, float(mp_sims[mi]), expected[mi], "mp")
 
         # rejected: report the stronger of the two signals for logging
         if cos_restate >= cos_mp:
-            return CheckResult(False, cos_restate, self._cand_texts[j], None)
+            return CheckResult(False, cos_restate, self._cand_texts[j_best], None)
         return CheckResult(False, cos_mp, matched_mp, None)
+
+    def _guarded_pick(self, above_idx, sims, step_clause, clause_of):
+        """Among candidates whose cosine >= tau (``above_idx``), return the best index to accept.
+
+        With the guard off: the highest-cosine candidate. With the guard on: scan ALL above-tau
+        candidates (highest cosine first) and return the FIRST whose parsed clause equals the
+        step's -- NOT just the argmax. This matters because bge-small cannot separate a negation
+        from its positive, so a negated variant can outscore the true (paraphrased) match; if we
+        only checked the top-1 we would falsely reject a valid step (hurting Panel A and wasting
+        resamples on Panel B). Returns None if no above-tau candidate is parse-equal.
+        """
+        if above_idx.size == 0:
+            return None
+        order = above_idx[np.argsort(-sims[above_idx])]
+        if not self.predicate_guard:
+            return int(order[0])
+        if step_clause is None:
+            return None
+        for k in order:
+            if clause_of(int(k)) == step_clause:
+                return int(k)
+        return None
 
     def accept(self, step_text: str) -> None:
         """Add an accepted step to the candidate set and extend the fact frontier."""
@@ -151,10 +165,7 @@ class SemanticChecker:
         else:
             self._cand_embs = np.vstack([self._cand_embs, emb])
         self._cand_texts.append(step_text)
-
-        parsed = _parse_sentence(step_text)
-        if parsed is not None and parsed[0] == "fact":
-            self._frontier.add((parsed[1], parsed[2], parsed[3]))
+        self._ingest(step_text)
 
     @property
     def candidate_set_size(self) -> int:
@@ -175,21 +186,19 @@ class SemanticChecker:
         return cached
 
     def _synthesize_expected(self) -> list[str]:
-        """Expected next steps: apply each context rule to each non-negated frontier fact.
+        """Expected next steps: apply each context rule to each frontier membership fact.
 
-        (entity is-a C) + rule (C -> D, negated?) => expected (entity is[-not]-a D).
-        Negated frontier facts are conservatively skipped. Rendered via the shared templates.
+        (entity is a C) + rule (every C is [not] a D | every C is [not] <prop>)
+            => expected (entity is [not] a D)  or  (entity is [not] <prop>).
+        Rendered via the shared grammar so phrasing matches the model's output.
         """
         out: list[str] = []
         seen: set[str] = set()
-        for (entity, concept, neg) in self._frontier:
-            if neg:
-                continue
-            for (ante, cons, rneg) in self._rules:
+        for (entity, concept) in self._frontier:
+            for (ante, cons, is_prop, rneg) in self._rules:
                 if ante != concept:
                     continue
-                tid = "entity_neg" if rneg else "entity_pos"
-                sentence = gr.render_template(tid, [entity, cons])
+                sentence = gr.render_fact(entity, cons, is_prop, rneg)
                 if sentence not in seen:
                     seen.add(sentence)
                     out.append(sentence)

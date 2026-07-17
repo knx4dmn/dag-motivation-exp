@@ -447,7 +447,7 @@ def run_symbolic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
     backend = HFModelBackend(model, sync)
 
     t0 = time.perf_counter()
-    ebnf = gr.build_item_ebnf(item.entities, item.concepts)
+    ebnf = gr.build_item_ebnf(item.entities, item.concepts, item.properties)
     compiled = gr.compile_item_grammar(ebnf, compiler)
     grammar_compile_s = time.perf_counter() - t0
 

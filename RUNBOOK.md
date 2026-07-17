@@ -104,11 +104,18 @@ trips or a run OOMs on the top bucket, escalate in this order:
 cell. Completed `(model, method, bucket, item_id)` tuples are skipped; a half-written last line
 is tolerated by the loader. No manual cleanup.
 
-**`raw_prontoqa_adapter` error in Phase 1.** The upstream `generate_question` return shape
-differs from the adapter's expectations. In Cell 3, uncomment the `print(raw); raise SystemExit`
-line to see one raw item, then extend the key lists (or the tuple/object branch) in
-`datagen.raw_prontoqa_adapter` and re-push. This is the one integration point that could not be
-verified without the repo cloned.
+**Phase 1 data generation.** The generator is driven through `_prontoqa_bridge`, which handles
+two upstream quirks: (a) `run_experiment.py` opens `bad_patterns.txt` by a relative path at import
+time, so the bridge runs the import and every call with cwd set to the clone dir; (b)
+`generate_question` returns `(None,)*6` on stochastic failure (~a few percent succeed per call),
+so the bridge retries until success — this is the author's own intended usage, so slow-looking
+generation is normal. The adapter targets the verified 6-tuple
+`(question_text, query, formulas, chain_of_thought, str(answer), proof)`. Vocabulary isolation is
+guaranteed structurally: each base item and each pool item gets its own **disjoint synthetic
+concept block** (registered with the generator's morphology), so no distractor can share a concept
+with any base item. If generation is slow, it's the retry loop; if it errors on `add_noun`
+("already added"), a synthetic name collided with a reserved one — regenerate with a different
+`GLOBAL_SEED` (the generator already filters reserved names, so this should not happen).
 
 **XGrammar install/first-use error.** `xgrammar==0.1.34` pulls `apache-tvm-ffi` + `pydantic`
 and is installed under the torch-pinning constraints file so it can't swap torch. If its CUDA
