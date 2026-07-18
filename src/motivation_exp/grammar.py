@@ -87,6 +87,33 @@ _RULE_PROP = re.compile(rf"^(?:Every|Each) ({_LWORD}) is (not )?({_LWORD})\.$")
 _PLURAL = re.compile(rf"^({_CWORD}) are (not )?({_LWORD})\.$")
 
 
+_LEADING_CONNECTIVE = re.compile(
+    r"^(so|therefore|thus|then|hence|hereby|next|clearly|this means( that)?|"
+    r"we know( that)?|it follows( that)?)[,]?\s+",
+    re.IGNORECASE,
+)
+_MID_CONNECTIVE = re.compile(r"\b(therefore|thus|hence)\s+", re.IGNORECASE)
+
+
+def strip_connectives(sentence: str) -> str:
+    """Remove reasoning connectives an unguided LM adds to an otherwise-templatic step.
+
+    e.g. "So Wren is a wumpus." / "Therefore, Wren is a wumpus." / "Wren is a wumpus, so it is
+    not slow." -> "Wren is a wumpus." Diagnostic/normalization helper (see diagnostics/); NOT
+    wired into :func:`parse_clause`'s accept path -- proposed fix pending review.
+    """
+    s = sentence.strip()
+    prev = None
+    while s != prev:                                   # peel stacked leading connectives
+        prev = s
+        s = _LEADING_CONNECTIVE.sub("", s).strip()
+    s = re.split(r",\s*(?:so|therefore|thus|hence)\b", s, flags=re.IGNORECASE)[0].strip()  # compound tail
+    s = _MID_CONNECTIVE.sub("", s).strip()
+    if s and not s.endswith("."):
+        s += "."
+    return (s[0].upper() + s[1:]) if s else s
+
+
 def parse_clause(sentence: str) -> Clause | None:
     """Parse one PrOntoQA sentence into a :class:`Clause`, or None if it matches no form.
 

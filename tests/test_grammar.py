@@ -58,6 +58,51 @@ def test_paraphrase_parses_equal_for_guard():
     assert gr.parse_clause("Tumpuses are wumpuses.") == gr.parse_clause("Every tumpus is a wumpus.")
 
 
+def test_strip_connectives_recovers_parse():
+    # parse_clause fails on connective-prefixed steps; strip_connectives recovers them
+    for phrasing in ["So Wren is a wumpus.", "Therefore, Wren is a wumpus.", "Thus Wren is a wumpus.",
+                     "We know that Wren is a wumpus.", "Wren is therefore a wumpus.",
+                     "Wren is a wumpus, so it is not slow."]:
+        assert gr.parse_clause(phrasing) is None                       # raw: fails
+        assert gr.parse_clause(gr.strip_connectives(phrasing)) == gr.parse_clause("Wren is a wumpus.")
+    assert gr.strip_connectives("Wren is a wumpus.") == "Wren is a wumpus."  # canonical unchanged
+
+
+# every canonical clause form, incl. negation / plural / property
+_CANONICAL = [
+    "Wren is a tumpus.", "Wren is an impus.", "Wren is not a tumpus.",
+    "Wren is slow.", "Wren is not slow.",
+    "Every tumpus is a wumpus.", "Each tumpus is not a wumpus.",
+    "Every tumpus is shy.", "Each tumpus is not shy.",
+    "Tumpuses are wumpuses.", "Tumpuses are not slow.",
+]
+
+
+def test_strip_connectives_is_clause_invariant_on_canonical_forms():
+    """strip_connectives must NOT change the parsed Clause of an already-canonical step -- in
+    particular it must never touch polarity (negated) or the predicate."""
+    for s in _CANONICAL:
+        assert gr.parse_clause(gr.strip_connectives(s)) == gr.parse_clause(s), s
+
+
+def test_strip_connectives_never_removes_negation():
+    # a connective in front of a NEGATED step: strip the connective, keep 'not' and the predicate
+    for s in _CANONICAL:
+        c = gr.parse_clause(s)
+        for lead in ("So ", "Therefore, ", "Thus ", "We know that "):
+            stripped = gr.parse_clause(gr.strip_connectives(lead + s[0].lower() + s[1:]))
+            assert stripped == c, (lead, s)          # same subject/pred/is_property/NEGATED
+    # explicit: negation survives
+    assert gr.parse_clause(gr.strip_connectives("So Sally is not slow.")) == gr.parse_clause("Sally is not slow.")
+    assert "not" in gr.strip_connectives("Therefore, Sally is not slow.")
+
+
+def test_strip_connectives_does_not_over_strip_concepts_starting_like_connectives():
+    # a concept/name that merely STARTS with connective letters must not be truncated
+    assert gr.strip_connectives("Sopus is a wumpus.") == "Sopus is a wumpus."   # 'So' not a prefix token
+    assert gr.strip_connectives("Thenpus is a wumpus.") == "Thenpus is a wumpus."
+
+
 # --------------------------------------------------------------------------------------
 # EBNF build
 # --------------------------------------------------------------------------------------

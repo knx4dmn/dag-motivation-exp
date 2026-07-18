@@ -111,6 +111,11 @@ TAU_GRID = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]  # swept in Phase 1.5
 # Phase 1.5). It verifies the associative-match winner; it does NOT replace the full-candidate
 # similarity search (the O(context) op Panel B measures / CAM maps to). Keep ON for reported runs.
 PREDICATE_GUARD = True
+# Normalize each step by stripping leading discourse connectives ("So"/"Therefore"/... ) before
+# parsing, so the UNGUIDED model's connective-prefixed VALID steps aren't false-rejected (see
+# diagnostics/offline_false_reject.py). Strips ONLY closed-set leading connectives -- never "not",
+# never a predicate -- so the negation guard is preserved. Default False pending the A/B pilot.
+STRIP_CONNECTIVES = False
 
 # --------------------------------------------------------------------------------------
 # RNG seeds

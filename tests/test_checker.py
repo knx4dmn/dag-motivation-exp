@@ -127,6 +127,21 @@ def test_guard_scans_all_above_tau_not_just_argmax():
     assert r.cosine == pytest.approx(0.88, abs=1e-4)
 
 
+def test_unparsed_step_counter_and_false_reject_logging():
+    """A connective-prefixed VALID step fails parse -> rejected -> flagged likely_false_reject."""
+    c = SemanticChecker(_stub_encode, 0.6, 0.6, predicate_guard=True, log_decisions=True)
+    c.prefill(["Wren is a tumpus.", "Every tumpus is a wumpus."])
+    res = c.check_step("So Wren is a wumpus.")     # valid MP step, but non-canonical phrasing
+    assert not res.accepted                        # parse fails -> guard can't match -> rejected
+    assert c.n_unparsed_steps == 1                 # always-on counter (behavior-neutral)
+    rec = c.step_log[-1]
+    assert rec["parsed"] is False
+    assert rec["likely_false_reject"] is True      # connective-stripped copy WOULD parse + match
+    # a genuinely wrong step is NOT flagged as a false reject
+    c.check_step("Wren is a zorptumpus.")
+    assert c.step_log[-1]["likely_false_reject"] is False
+
+
 def test_candidate_clauses_parsed_once_not_per_step(monkeypatch):
     """The guard scans the full above-tau candidate set each step, but candidate sentences are
     parsed ONCE (at prefill/accept) and cached -- never re-parsed per step (avoidable Panel B cost)."""

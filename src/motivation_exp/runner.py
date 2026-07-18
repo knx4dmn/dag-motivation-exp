@@ -513,7 +513,10 @@ def run_semantic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
                 "duplicate_resample": stats.duplicate_resample,
                 "no_boundary_forced": stats.no_boundary_forced,
                 "candidate_set_size": stats.candidate_set_size,
-                "n_forward_passes": stats.n_forward_passes, "raw_forward_s": backend.forward_s}
+                "n_forward_passes": stats.n_forward_passes, "raw_forward_s": backend.forward_s,
+                # diagnostic (behavior-neutral): steps whose surface form failed parse_clause --
+                # the prime false-reject channel for the unguided model (connective-prefixed steps).
+                "n_unparsed_steps": getattr(checker, "n_unparsed_steps", 0)}
     row = _base_row(item, "semantic", model_name, gpu, env_hash)
     return _finish_row(row, text, item, decode_wall, prefill_wall, len(gen), overhead)
 

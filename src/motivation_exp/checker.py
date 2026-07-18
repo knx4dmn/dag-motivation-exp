@@ -45,6 +45,8 @@ class SemanticChecker:
         tau_restate: float,
         tau_mp: float,
         predicate_guard: bool = True,
+        log_decisions: bool = False,
+        strip_connectives: bool = False,
     ) -> None:
         if tau_restate is None or tau_mp is None:
             raise ValueError("tau thresholds must be calibrated (not None) before checking")
@@ -59,6 +61,18 @@ class SemanticChecker:
         # step -- the O(context) operation Panel B measures and CAM maps to). Paraphrases still
         # pass because they parse to the same Clause. Calibrate/verify in Phase 1.5.
         self.predicate_guard = bool(predicate_guard)
+
+        # Diagnostics (behavior-neutral): count steps whose surface form fails parse_clause (the
+        # prime false-reject channel for the UNGUIDED model -- connective-prefixed steps), and,
+        # when log_decisions is on, keep a per-step record incl. a false-reject label computed by
+        # re-parsing a connective-stripped copy. None of this affects the accept decision.
+        self.log_decisions = bool(log_decisions)
+        self.step_log: list[dict] = []
+        self.n_unparsed_steps = 0
+        # When on, normalize each step (strip leading discourse connectives) before embedding +
+        # parsing, and store the normalized form in the candidate set. Closed-set, polarity- and
+        # predicate-preserving (see grammar.strip_connectives), so the guard is unaffected.
+        self.strip_connectives = bool(strip_connectives)
 
         # candidate set (restate target): context sentences + accepted steps. Each candidate's
         # parsed clause is cached HERE (parsed once at prefill/accept), so the per-step guard --
@@ -103,8 +117,11 @@ class SemanticChecker:
         if not step_text or self._cand_embs is None:
             return CheckResult(False, 0.0, None, None)
 
-        emb = self._embed([step_text])[0]  # [d]
-        step_clause = gr.parse_clause(step_text)
+        prepped = self._prep(step_text)      # normalized (connective-stripped) iff flag on
+        emb = self._embed([prepped])[0]  # [d]
+        step_clause = gr.parse_clause(prepped)
+        if step_clause is None:
+            self.n_unparsed_steps += 1
 
         # (a) restate: associative cosine match over the FULL candidate set (context + accepted
         #     steps). This full-set similarity search is the mechanism -- it always runs, and its
@@ -115,7 +132,8 @@ class SemanticChecker:
         above = np.nonzero(sims >= self.tau_restate)[0]
         rj = self._guarded_pick(above, sims, step_clause, lambda k: self._cand_clauses[k])  # cached
         if rj is not None:
-            return CheckResult(True, float(sims[rj]), self._cand_texts[rj], "restate")
+            return self._record(step_text, step_clause,
+                                CheckResult(True, float(sims[rj]), self._cand_texts[rj], "restate"))
 
         # (b) modus-ponens: cosine vs synthesized expected-next-step strings (guarded likewise).
         #     _synthesize_expected returns (text, clause) pairs -- the clause is constructed, not
@@ -132,12 +150,34 @@ class SemanticChecker:
             above_mp = np.nonzero(mp_sims >= self.tau_mp)[0]
             mi = self._guarded_pick(above_mp, mp_sims, step_clause, lambda k: exp_clauses[k])
             if mi is not None:
-                return CheckResult(True, float(mp_sims[mi]), exp_texts[mi], "mp")
+                return self._record(step_text, step_clause,
+                                    CheckResult(True, float(mp_sims[mi]), exp_texts[mi], "mp"))
 
         # rejected: report the stronger of the two signals for logging
         if cos_restate >= cos_mp:
-            return CheckResult(False, cos_restate, self._cand_texts[j_best], None)
-        return CheckResult(False, cos_mp, matched_mp, None)
+            return self._record(step_text, step_clause,
+                                CheckResult(False, cos_restate, self._cand_texts[j_best], None))
+        return self._record(step_text, step_clause, CheckResult(False, cos_mp, matched_mp, None))
+
+    def _record(self, step_text, step_clause, result: CheckResult) -> CheckResult:
+        """Optionally log a per-step decision with a false-reject label (diagnostics only)."""
+        if not self.log_decisions:
+            return result
+        likely_false_reject = False
+        if not result.accepted:
+            # would a connective-stripped copy parse AND match a candidate / expected clause?
+            norm = gr.parse_clause(gr.strip_connectives(step_text))
+            if norm is not None:
+                restate_hit = any(norm == cc for cc in self._cand_clauses if cc is not None)
+                mp_hit = any(norm == c for _, c in self._synthesize_expected())
+                likely_false_reject = restate_hit or mp_hit
+        self.step_log.append({
+            "step": step_text, "accepted": result.accepted, "kind": result.kind,
+            "cosine": result.cosine, "parsed": step_clause is not None,
+            "candidate_set_size": len(self._cand_texts),
+            "likely_false_reject": likely_false_reject,
+        })
+        return result
 
     def _guarded_pick(self, above_idx, sims, step_clause, clause_of):
         """Among candidates whose cosine >= tau (``above_idx``), return the best index to accept.
@@ -163,7 +203,7 @@ class SemanticChecker:
 
     def accept(self, step_text: str) -> None:
         """Add an accepted step to the candidate set and extend the fact frontier."""
-        step_text = step_text.strip()
+        step_text = self._prep(step_text.strip())    # store the normalized form so later restatements match
         if not step_text:
             return
         emb = self._embed([step_text])  # [1, d]
@@ -175,6 +215,10 @@ class SemanticChecker:
         c = gr.parse_clause(step_text)      # parse ONCE at accept time; cache alongside
         self._cand_clauses.append(c)
         self._ingest_clause(c)
+
+    def _prep(self, text: str) -> str:
+        """Normalize a step for verification: strip leading discourse connectives iff enabled."""
+        return gr.strip_connectives(text) if self.strip_connectives else text
 
     @property
     def candidate_set_size(self) -> int:
