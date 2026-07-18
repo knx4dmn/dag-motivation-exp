@@ -72,10 +72,12 @@ FULL_ITEMS_PER_BUCKET = 100
 N_CALIB_ITEMS = 10       # held-out for Phase 1.5 tau sweep (disjoint from pilot + full)
 N_EXEMPLAR_ITEMS = 1     # few-shot exemplar(s); independent ontology, never in a bucket
 # Base questions to generate = full/bucket + spares (that fail validation) + calib + exemplar.
-# Each base item gets its own disjoint concept block; pool items draw from a further-disjoint
-# block range, so every distractor is concept-disjoint from every base item.
+# Each base item gets its OWN disjoint concept block. Pool items instead sample blocks from a
+# shared POOL_CONCEPT_SPACE that is disjoint from ALL base blocks -- so every distractor is
+# concept-disjoint from every base item, without needing N_POOL_ITEMS*block distinct names.
 N_BASE_ITEMS = 150
-N_POOL_ITEMS = 300       # independent ontologies harvested for the distractor pool
+N_POOL_ITEMS = 1000          # independent ontologies for the distractor pool (generation is cheap)
+POOL_CONCEPT_SPACE = 2000    # shared concept vocabulary the pool items sample their blocks from
 
 # --------------------------------------------------------------------------------------
 # Decoding (plan section 4)

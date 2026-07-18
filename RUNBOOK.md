@@ -34,10 +34,14 @@ selection — chunked prefill is required, not optional. (This is stated in the 
 
 ## 1. Cell order
 
-Run top to bottom: **Cell 1 (setup) → Cell 2 (Phase 0) → Cell 3 (Phase 1) → Cell 4 (Phase 1.5) →
-Cell 5 (Phase 2 pilot) → Cell 6 (Phase 3 full) → Cell 7 (Phase 4 plots).**
+Run top to bottom: **Setup → Phase 0 (smoke) → Phase 1a (generate) → Phase 1b (bucket) →
+Phase 1.5 (τ calibration) → Phase 2 (pilot) → Phase 3 (full) → Phase 4 (plots).**
 
 Every heavy cell writes to Google Drive and is safe to re-run after a disconnect — it resumes.
+Phase 1 is deliberately **two cells**: 1a generates raw items and checkpoints each one to Drive
+immediately (so a disconnect during the ~20-min generation loses at most the item in flight); 1b
+reads those back and buckets them (fast — never regenerates). If a disconnect happens mid-1a, just
+re-run 1a: it skips every item already on Drive and continues.
 
 ---
 
@@ -73,8 +77,9 @@ accepts everything (vacuous) or so high it force-accepts everything. Both are vi
 | Phase | What | Rough time |
 |---|---|---|
 | 0 | deps + model load + 8k smoke | 5–10 min |
-| 1 | generate 150 base + 200 pool, bucket, validate | 10–20 min |
-| 1.5 | τ sweep on 10 items | 2–5 min |
+| 1a | generate 150 base + 1000 pool items (checkpointed) | 15–30 min (retry-bound; resumable) |
+| 1b | bucket + validate (pool tokenized once, O(n)) | 1–3 min |
+| 1.5 | τ sweep + discrimination test on 10 items | 2–5 min |
 | 2 | pilot: 20×5×3 = 300 generations | 1–2 GPU-hours |
 | 3 | full: 100×5×3 = 1500 generations | 8–12 GPU-hours (semantic retries + long-bucket prefill dominate) |
 | 4 | plots | < 1 min |
@@ -104,18 +109,23 @@ trips or a run OOMs on the top bucket, escalate in this order:
 cell. Completed `(model, method, bucket, item_id)` tuples are skipped; a half-written last line
 is tolerated by the loader. No manual cleanup.
 
-**Phase 1 data generation.** The generator is driven through `_prontoqa_bridge`, which handles
-two upstream quirks: (a) `run_experiment.py` opens `bad_patterns.txt` by a relative path at import
-time, so the bridge runs the import and every call with cwd set to the clone dir; (b)
-`generate_question` returns `(None,)*6` on stochastic failure (~a few percent succeed per call),
-so the bridge retries until success — this is the author's own intended usage, so slow-looking
-generation is normal. The adapter targets the verified 6-tuple
-`(question_text, query, formulas, chain_of_thought, str(answer), proof)`. Vocabulary isolation is
-guaranteed structurally: each base item and each pool item gets its own **disjoint synthetic
-concept block** (registered with the generator's morphology), so no distractor can share a concept
-with any base item. If generation is slow, it's the retry loop; if it errors on `add_noun`
-("already added"), a synthetic name collided with a reserved one — regenerate with a different
-`GLOBAL_SEED` (the generator already filters reserved names, so this should not happen).
+**Phase 1a generation is slow / looks hung.** It isn't hung — `generate_question` succeeds only a
+few percent of the time and the bridge retries (the author's intended usage). The cell prints
+progress every 25 new items with a running `gen_tries` and `warnings_suppressed` count (the
+generator's thousands of "could not extend ontology" lines are aggregated, not printed). Each item
+is checkpointed to `base_raw.jsonl` / `pool_raw.jsonl` the moment it's generated, so a disconnect
+loses at most one item — **re-run 1a to resume**. The adapter targets the verified 6-tuple
+`(question_text, query, formulas, chain_of_thought, str(answer), proof)`. If 1a raises
+`RuntimeError: generate_question failed after N tries`, the concept block is too small for the
+proof depth — raise `CONCEPT_BLOCK_SIZE` or lower `N_HOPS`.
+
+**Phase 1b pool exhaustion.** Bucketing pre-tokenizes the pool once and selects distractors by
+summed length (fast). If the distractor pool is too small to reach a bucket (mostly a risk at 8k),
+the cell prints a loud `WARN <base_id> bucket <N>: reached <t> tokens ... pool likely exhausted`
+per affected item and the validation gate drops it. Fix by raising `N_POOL_ITEMS` (generation is
+cheap) and re-running 1a then 1b. Vocabulary isolation is structural: base items use disjoint
+concept blocks and pool items sample a **base-disjoint** shared concept space, so no distractor
+shares a concept with any base item.
 
 **XGrammar install/first-use error.** `xgrammar==0.1.34` pulls `apache-tvm-ffi` + `pydantic`
 and is installed under the torch-pinning constraints file so it can't swap torch. If its CUDA

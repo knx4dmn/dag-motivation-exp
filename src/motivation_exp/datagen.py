@@ -16,6 +16,7 @@ step-boundary / vocabulary logic cannot silently diverge.
 from __future__ import annotations
 
 import json
+import os
 import random
 import re
 import statistics
@@ -310,42 +311,92 @@ def _assemble_prompt_text(context: Sequence[str], question: str) -> str:
     return " ".join(list(context) + [question])
 
 
+class DistractorPool:
+    """Pre-tokenized + pre-parsed distractor pool -- the key to O(n) bucketing.
+
+    The old bucketer re-tokenized the ENTIRE growing context after every single distractor
+    insertion (O(sentences^2 * tokens) -- ~450M tokens at the 8k bucket). Here each pool
+    sentence is tokenized ONCE and its entity/concept names extracted ONCE, up front. Bucketing
+    then selects sentences by summing precomputed lengths (no per-insertion tokenize) and does a
+    single full tokenize per item-bucket to record the exact count.
+    """
+
+    def __init__(self, sentences: Sequence[str], count_tokens: CountTokens):
+        self.sentences = list(sentences)
+        self.lens = [count_tokens(s) for s in self.sentences]          # tokenize each ONCE
+        self.names: list[frozenset[str]] = []                          # parse each ONCE
+        for s in self.sentences:
+            ents, cons, _props = extract_vocabulary([s])
+            self.names.append(frozenset(n.lower() for n in ents) | frozenset(c.lower() for c in cons))
+        self.avg_len = (sum(self.lens) / len(self.lens)) if self.lens else 1.0
+
+    def usable_indices(self, base: Item) -> list[int]:
+        """Indices of pool sentences that share no entity/concept name with ``base``."""
+        bn = _names_in(base)
+        return [i for i, nm in enumerate(self.names) if nm.isdisjoint(bn)]
+
+
 def bucket_one_item(
     base: Item,
     bucket: int,
-    distractor_pool: Sequence[str],
+    pool: "DistractorPool | Sequence[str]",
     count_tokens: CountTokens,
     seed: int,
     tol: float = 0.05,
+    *,
+    max_correction: int = 6,
 ) -> Item:
-    """Interleave distractors into ``base``'s context until the prompt hits ``bucket`` tokens.
+    """Bucket one base item to a target token count using summed pre-tokenized lengths.
 
-    Gold sentences keep their relative order; distractors are inserted at uniformly random
-    positions with a fixed, recorded seed. The query sentence always comes last. Grows the
-    context until token count reaches ``bucket`` (within +/- ``tol``) or the pool is
-    exhausted. Returns a NEW Item with bucket/token_count/seed populated.
+    ``pool`` may be a :class:`DistractorPool` (fast path) or a raw sentence list (wrapped once).
+    Selects distractors whose summed lengths approach ``bucket``, assembles them at fixed-seed
+    random positions (gold order preserved, query last), then does a SINGLE full tokenize and up
+    to ``max_correction`` add/remove-and-retokenize steps to land within +/- ``tol``. Returns a
+    NEW Item; ``token_count`` is the exact final count (the validation gate rejects out-of-band).
     """
+    if not isinstance(pool, DistractorPool):
+        pool = DistractorPool(pool, count_tokens)
+
     rng = random.Random(seed)
-    usable = filter_colliding(distractor_pool, base)
-    rng.shuffle(usable)
+    order = pool.usable_indices(base)
+    rng.shuffle(order)
 
     gold = list(base.context)
-    target_hi = bucket * (1 + tol)
-    current = list(gold)
+    base_len = count_tokens(_assemble_prompt_text(gold, base.question))  # one tokenize
+    lo, hi = bucket * (1 - tol), bucket * (1 + tol)
 
-    def tok(ctx: list[str]) -> int:
-        return count_tokens(_assemble_prompt_text(ctx, base.question))
+    # initial count from summed estimate
+    need = max(0, bucket - base_len)
+    cum, n = 0, 0
+    for idx in order:
+        if cum >= need:
+            break
+        cum += pool.lens[idx]
+        n += 1
 
-    di = 0
-    # Grow until we reach the lower edge of tolerance; stop before exceeding the upper edge.
-    while tok(current) < bucket * (1 - tol) and di < len(usable):
-        insert_at = rng.randint(0, len(current))  # never after the (implicit) trailing query
-        candidate = current[:insert_at] + [usable[di]] + current[insert_at:]
-        if tok(candidate) > target_hi:
-            di += 1  # this distractor overshoots; try the next (they vary in length)
-            continue
-        current = candidate
-        di += 1
+    def assemble(k: int) -> list[str]:
+        cur = list(gold)
+        r = random.Random(seed)              # deterministic positions for a given k
+        for idx in order[:k]:
+            cur.insert(r.randint(0, len(cur)), pool.sentences[idx])
+        return cur
+
+    current = assemble(n)
+    exact = count_tokens(_assemble_prompt_text(current, base.question))
+    # bounded correction: adjust the sentence count proportionally, re-tokenize (<= max_correction)
+    for _ in range(max_correction):
+        if lo <= exact <= hi:
+            break
+        if exact < lo:
+            if n >= len(order):
+                break                         # pool exhausted -- caller reports (loud failure)
+            n = min(len(order), n + max(1, int((bucket - exact) / max(1.0, pool.avg_len))))
+        else:
+            if n == 0:
+                break
+            n = max(0, n - max(1, int((exact - bucket) / max(1.0, pool.avg_len))))
+        current = assemble(n)
+        exact = count_tokens(_assemble_prompt_text(current, base.question))
 
     return Item(
         item_id=f"{base.base_id}__b{bucket}",
@@ -359,7 +410,7 @@ def bucket_one_item(
         gold_steps=base.gold_steps,
         n_hops=base.n_hops,
         bucket=bucket,
-        token_count=tok(current),
+        token_count=exact,
         seed=seed,
         gold_context=list(gold),
     )
@@ -368,23 +419,35 @@ def bucket_one_item(
 def bucket_to_token_targets(
     items: Sequence[Item],
     count_tokens: CountTokens,
-    distractor_pool: Sequence[str],
+    distractor_pool: "DistractorPool | Sequence[str]",
     targets: Sequence[int],
     base_seed: int = 0,
     tol: float = 0.05,
+    *,
+    log: Callable[[str], None] | None = None,
 ) -> dict[int, list[Item]]:
-    """Bucket every base item to every target token count.
+    """Bucket every base item to every target token count (O(n): pool tokenized once).
 
-    Per-item insertion seeds are derived deterministically from ``base_seed`` and recorded
-    on each produced item. Returns {bucket: [Item, ...]}.
+    ``log`` (default: no-op) receives progress lines and loud per-item pool-exhaustion warnings.
+    Per-item insertion seeds are derived deterministically from ``base_seed``. Returns
+    {bucket: [Item, ...]}.
     """
+    log = log or (lambda _m: None)
+    pool = distractor_pool if isinstance(distractor_pool, DistractorPool) else DistractorPool(distractor_pool, count_tokens)
+    log(f"[bucketing] pool ready: {len(pool.sentences)} sentences pre-tokenized")
+
     out: dict[int, list[Item]] = {b: [] for b in targets}
+    total = len(items)
     for i, base in enumerate(items):
         for bucket in targets:
-            seed = base_seed + i * 1000 + bucket  # deterministic, unique per (item, bucket)
-            out[bucket].append(
-                bucket_one_item(base, bucket, distractor_pool, count_tokens, seed, tol)
-            )
+            seed = base_seed + i * 1000 + bucket   # deterministic, unique per (item, bucket)
+            it = bucket_one_item(base, bucket, pool, count_tokens, seed, tol)
+            out[bucket].append(it)
+            if not (bucket * (1 - tol) <= (it.token_count or 0) <= bucket * (1 + tol)):
+                log(f"[bucketing] WARN {base.base_id} bucket {bucket}: reached {it.token_count} "
+                    f"tokens (target {bucket} +/-{int(tol*100)}%) -- pool likely exhausted")
+        if (i + 1) % 10 == 0 or i + 1 == total:
+            log(f"[bucketing] {i + 1}/{total} base items done")
     return out
 
 
@@ -492,12 +555,26 @@ def hf_token_counter(tokenizer) -> CountTokens:
 def load_items(path: str) -> list[Item]:
     """Reload items from a JSONL file written by Phase 1 (for resumable later phases)."""
     out: list[Item] = []
+    if not os.path.exists(path):
+        return out
     with open(path) as f:
         for line in f:
             line = line.strip()
-            if line:
+            if not line:
+                continue
+            try:
                 out.append(Item(**json.loads(line)))
+            except json.JSONDecodeError:
+                continue  # tolerate a trailing partial line from a mid-write disconnect
     return out
+
+
+def append_item(path: str, item: Item) -> None:
+    """Append one item to a JSONL checkpoint and fsync (so generation is resumable, R1)."""
+    with open(path, "a") as f:
+        f.write(json.dumps(item.to_json()) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
 
 
 # --------------------------------------------------------------------------------------

@@ -20,6 +20,26 @@ import sys
 from typing import Sequence
 
 
+class _WarnCountingSink:
+    """A stdout replacement that counts (and discards) the generator's warning spam.
+
+    ``run_experiment`` prints thousands of "Could not extend ontology ..." lines when a concept
+    block is too small for a proof; unfiltered they truncate the real cell output. We aggregate
+    the count instead of forwarding the text.
+    """
+
+    def __init__(self):
+        self.warnings = 0
+
+    def write(self, s):
+        if "Could not extend" in s or "insufficient" in s:
+            self.warnings += 1
+        return len(s)
+
+    def flush(self):
+        pass
+
+
 class ProntoQABridge:
     """Thin wrapper that imports and drives ``run_experiment`` from a clone directory."""
 
@@ -28,6 +48,10 @@ class ProntoQABridge:
         if not os.path.isfile(os.path.join(self.dir, "run_experiment.py")):
             raise FileNotFoundError(f"run_experiment.py not found under {self.dir!r}")
         self._mod = None
+        # aggregate stats across all generate() calls
+        self.total_calls = 0        # successful generate() calls
+        self.total_tries = 0        # generate_question invocations (incl. retries)
+        self.total_warnings = 0     # suppressed "could not extend ontology" warnings
 
     @contextlib.contextmanager
     def _cwd(self):
@@ -64,21 +88,30 @@ class ProntoQABridge:
         dg.register_concepts(self.morphology, names)
 
     def generate(self, num_deduction_steps: int, concept_block: Sequence[str] | None,
-                 *, max_tries: int = 500, **kwargs):
+                 *, max_tries: int = 500, suppress_output: bool = True, **kwargs):
         """Return one successful 6-tuple from ``generate_question``, retrying on None failures.
 
         ``concept_block`` is the disjoint block of (already-registered) concept names for this
         item, or None to use the upstream defaults. ``kwargs`` pass through (ontology,
-        distractors, deduction_rule, formula_ordering, proof_width, no_adjectives, ...).
+        distractors, deduction_rule, formula_ordering, proof_width, no_adjectives, ...). The
+        generator's per-try "could not extend ontology" warning spam is suppressed and counted
+        (``total_warnings``); raises loudly with context if ``max_tries`` is exhausted.
         """
         gq = self.module.generate_question
         block = list(concept_block) if concept_block else None
-        with self._cwd():
-            for _ in range(max_tries):
+        sink = _WarnCountingSink()
+        redirect = contextlib.redirect_stdout(sink) if suppress_output else contextlib.nullcontext()
+        with self._cwd(), redirect:
+            for t in range(max_tries):
+                self.total_tries += 1
                 out = gq(num_deduction_steps, list(block) if block else None, **kwargs)
                 if out[0] is not None:
+                    self.total_calls += 1
+                    self.total_warnings += sink.warnings
                     return out
+        self.total_warnings += sink.warnings
         raise RuntimeError(
             f"generate_question failed after {max_tries} tries "
-            f"(num_deduction_steps={num_deduction_steps}, block_size={len(block) if block else 0})"
+            f"(num_deduction_steps={num_deduction_steps}, block_size={len(block) if block else 0}, "
+            f"kwargs={kwargs}). Widen the concept block (CONCEPT_BLOCK_SIZE) or lower N_HOPS."
         )

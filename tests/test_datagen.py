@@ -169,3 +169,48 @@ def test_partition_blocks_pairwise_disjoint():
 def test_make_concept_names_raises_when_exhausted():
     with pytest.raises(ValueError):
         dg.make_concept_names(10_000_000, seed=0)
+
+
+# --------------------------------------------------------------------------------------
+# fast bucketing (DistractorPool) + loud failure + checkpoint IO
+# --------------------------------------------------------------------------------------
+def test_distractor_pool_precomputes_lengths_and_usable():
+    base = _base_item()  # concepts: tumpus, wumpus
+    sents = ["Sprocket is a yumpus.", "Every tumpus is a wumpus.", "Numo is a jompus."]
+    dp = dg.DistractorPool(sents, wc)
+    assert dp.lens == [4, 5, 4]                     # tokenized once each
+    usable = dp.usable_indices(base)                # index 1 shares 'tumpus' -> excluded
+    assert 1 not in usable and 0 in usable and 2 in usable
+
+
+def test_bucketing_lands_within_tolerance_all_buckets():
+    base = _base_item()
+    pool = [f"Alpha{i} beta gamma delta epsilon." for i in range(2000)]  # 5 words each, no collisions
+    out = dg.bucket_to_token_targets([base], wc, pool, targets=[100, 200, 400], base_seed=0)
+    for b in (100, 200, 400):
+        it = out[b][0]
+        assert b * 0.95 <= it.token_count <= b * 1.05, (b, it.token_count)
+
+
+def test_bucketing_warns_loudly_on_pool_exhaustion():
+    base = _base_item()
+    pool = ["Alpha beta gamma delta epsilon." for _ in range(3)]  # far too few for bucket 4096
+    msgs = []
+    dg.bucket_to_token_targets([base], wc, pool, targets=[4096], base_seed=0, log=msgs.append)
+    assert any("pool likely exhausted" in m and base.base_id in m for m in msgs)
+
+
+def test_append_and_load_items_resume(tmp_path):
+    p = tmp_path / "raw.jsonl"
+    a = _base_item()
+    dg.append_item(str(p), a)
+    dg.append_item(str(p), a)
+    # tolerate a trailing partial line (mid-write disconnect)
+    with open(p, "a") as f:
+        f.write('{"item_id": "partial"')
+    loaded = dg.load_items(str(p))
+    assert len(loaded) == 2 and loaded[0].item_id == a.item_id
+
+
+def test_load_items_missing_file_returns_empty(tmp_path):
+    assert dg.load_items(str(tmp_path / "nope.jsonl")) == []
