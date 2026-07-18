@@ -103,8 +103,8 @@ PER_STEP_TOKEN_CAP = 48                  # force a boundary if no period within 
 # --------------------------------------------------------------------------------------
 # Semantic thresholds -- FROZEN BY PHASE 1.5. None => uncalibrated (runner must refuse).
 # --------------------------------------------------------------------------------------
-TAU_RESTATE: float | None = None   # cosine >= this => step restates a context fact/rule
-TAU_MP: float | None = None        # cosine >= this => valid modus-ponens continuation
+TAU_RESTATE: float | None = 0.6    # FROZEN by Phase 1.5 clean sweep (predicate_guard supplies precision)
+TAU_MP: float | None = 0.6         # FROZEN by Phase 1.5 clean sweep
 TAU_GRID = [0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90]  # swept in Phase 1.5
 # Exact polarity/predicate match on the cosine-retrieved winner. Required because bge-small
 # cannot separate "X is slow"/"X is not slow" or distinct novel *pus concepts (verified in
