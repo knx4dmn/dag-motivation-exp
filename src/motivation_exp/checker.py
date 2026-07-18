@@ -60,9 +60,12 @@ class SemanticChecker:
         # pass because they parse to the same Clause. Calibrate/verify in Phase 1.5.
         self.predicate_guard = bool(predicate_guard)
 
-        # candidate set (restate target): context sentences + accepted steps
+        # candidate set (restate target): context sentences + accepted steps. Each candidate's
+        # parsed clause is cached HERE (parsed once at prefill/accept), so the per-step guard --
+        # which scans the whole above-tau set every step -- never re-parses the same sentence.
         self._cand_texts: list[str] = []
-        self._cand_embs: np.ndarray | None = None  # shape [n, d], L2-normalized
+        self._cand_clauses: list = []                        # parallel to _cand_texts (Clause | None)
+        self._cand_embs: np.ndarray | None = None            # shape [n, d], L2-normalized
 
         # structured knowledge for modus-ponens synthesis
         self._rules: list[tuple[str, str, bool, bool]] = []  # (ante_concept, cons, cons_is_property, negated)
@@ -73,17 +76,18 @@ class SemanticChecker:
     def prefill(self, context: Sequence[str]) -> None:
         """Embed all context sentences once and seed the rule set + fact frontier.
 
-        Timed and reported separately by the runner (``embed_prefill_s``).
+        Each context sentence is parsed ONCE here (cached in ``_cand_clauses``). Timed and
+        reported separately by the runner (``embed_prefill_s``).
         """
         texts = list(context)
         self._cand_texts = list(texts)
         self._cand_embs = self._embed(texts) if texts else None
-        for s in texts:
-            self._ingest(s)
+        self._cand_clauses = [gr.parse_clause(s) for s in texts]   # parse ONCE
+        for c in self._cand_clauses:
+            self._ingest_clause(c)
 
-    def _ingest(self, sentence: str) -> None:
-        """Update the rule set / fact frontier from one parsed clause."""
-        c = gr.parse_clause(sentence)
+    def _ingest_clause(self, c) -> None:
+        """Update the rule set / fact frontier from an already-parsed clause."""
         if c is None:
             return
         if c.kind == "rule":
@@ -109,23 +113,26 @@ class SemanticChecker:
         j_best = int(np.argmax(sims))
         cos_restate = float(sims[j_best])
         above = np.nonzero(sims >= self.tau_restate)[0]
-        rj = self._guarded_pick(above, sims, step_clause,
-                                lambda k: gr.parse_clause(self._cand_texts[k]))
+        rj = self._guarded_pick(above, sims, step_clause, lambda k: self._cand_clauses[k])  # cached
         if rj is not None:
             return CheckResult(True, float(sims[rj]), self._cand_texts[rj], "restate")
 
         # (b) modus-ponens: cosine vs synthesized expected-next-step strings (guarded likewise).
+        #     _synthesize_expected returns (text, clause) pairs -- the clause is constructed, not
+        #     re-parsed.
         expected = self._synthesize_expected()
         cos_mp, matched_mp = 0.0, None
         if expected:
-            exp_embs = np.stack([self._expected_emb(e) for e in expected])
+            exp_texts = [t for t, _ in expected]
+            exp_clauses = [c for _, c in expected]
+            exp_embs = np.stack([self._expected_emb(t) for t in exp_texts])
             mp_sims = exp_embs @ emb
             i_best = int(np.argmax(mp_sims))
-            cos_mp, matched_mp = float(mp_sims[i_best]), expected[i_best]
+            cos_mp, matched_mp = float(mp_sims[i_best]), exp_texts[i_best]
             above_mp = np.nonzero(mp_sims >= self.tau_mp)[0]
-            mi = self._guarded_pick(above_mp, mp_sims, step_clause, lambda k: gr.parse_clause(expected[k]))
+            mi = self._guarded_pick(above_mp, mp_sims, step_clause, lambda k: exp_clauses[k])
             if mi is not None:
-                return CheckResult(True, float(mp_sims[mi]), expected[mi], "mp")
+                return CheckResult(True, float(mp_sims[mi]), exp_texts[mi], "mp")
 
         # rejected: report the stronger of the two signals for logging
         if cos_restate >= cos_mp:
@@ -165,7 +172,9 @@ class SemanticChecker:
         else:
             self._cand_embs = np.vstack([self._cand_embs, emb])
         self._cand_texts.append(step_text)
-        self._ingest(step_text)
+        c = gr.parse_clause(step_text)      # parse ONCE at accept time; cache alongside
+        self._cand_clauses.append(c)
+        self._ingest_clause(c)
 
     @property
     def candidate_set_size(self) -> int:
@@ -185,14 +194,15 @@ class SemanticChecker:
             self._expected_cache[text] = cached
         return cached
 
-    def _synthesize_expected(self) -> list[str]:
-        """Expected next steps: apply each context rule to each frontier membership fact.
+    def _synthesize_expected(self) -> list[tuple[str, "gr.Clause"]]:
+        """Expected next steps as (text, clause) pairs: apply each rule to each frontier fact.
 
         (entity is a C) + rule (every C is [not] a D | every C is [not] <prop>)
             => expected (entity is [not] a D)  or  (entity is [not] <prop>).
-        Rendered via the shared grammar so phrasing matches the model's output.
+        The clause is CONSTRUCTED directly from the known semantic parts (not re-parsed), and the
+        text is rendered via the shared grammar so phrasing matches the model's output.
         """
-        out: list[str] = []
+        out: list[tuple[str, gr.Clause]] = []
         seen: set[str] = set()
         for (entity, concept) in self._frontier:
             for (ante, cons, is_prop, rneg) in self._rules:
@@ -201,7 +211,7 @@ class SemanticChecker:
                 sentence = gr.render_fact(entity, cons, is_prop, rneg)
                 if sentence not in seen:
                     seen.add(sentence)
-                    out.append(sentence)
+                    out.append((sentence, gr.Clause("fact", entity, cons, is_prop, rneg)))
         return out
 
 

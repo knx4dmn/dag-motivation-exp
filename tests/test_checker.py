@@ -69,7 +69,8 @@ def test_garbage_rejected():
 
 def test_synthesize_expected_concept_and_property():
     c = _checker()
-    assert "Wren is a wumpus." in c._synthesize_expected()
+    texts = [t for t, _ in c._synthesize_expected()]
+    assert "Wren is a wumpus." in texts
 
 
 def test_uncalibrated_tau_raises():
@@ -124,6 +125,24 @@ def test_guard_scans_all_above_tau_not_just_argmax():
     assert r.accepted and r.kind == "restate"
     assert r.matched == P                  # picked the parse-equal paraphrase, not the argmax negation
     assert r.cosine == pytest.approx(0.88, abs=1e-4)
+
+
+def test_candidate_clauses_parsed_once_not_per_step(monkeypatch):
+    """The guard scans the full above-tau candidate set each step, but candidate sentences are
+    parsed ONCE (at prefill/accept) and cached -- never re-parsed per step (avoidable Panel B cost)."""
+    import motivation_exp.checker as ck_mod
+    calls = {"n": 0}
+    orig = ck_mod.gr.parse_clause
+    monkeypatch.setattr(ck_mod.gr, "parse_clause",
+                        lambda s: (calls.__setitem__("n", calls["n"] + 1), orig(s))[1])
+
+    ctx = ["Wren is a tumpus.", "Every tumpus is a wumpus.", "Wumpuses are not slow."]
+    c = SemanticChecker(_stub_encode, tau_restate=0.6, tau_mp=0.6)  # low tau -> many above threshold
+    c.prefill(ctx)
+    assert calls["n"] == 3                       # 3 context sentences parsed once at prefill
+    for _ in range(10):
+        c.check_step("Wren is a wumpus.")        # scans candidates but re-parses NONE of them
+    assert calls["n"] == 3 + 10                  # exactly +1 per step (the step itself), not +candidates
 
 
 def test_full_candidate_set_similarity_runs_every_step():
