@@ -64,6 +64,10 @@ class DecodeCfg:
     # OFF-vs-ON A/B is controlled (same RNG stream; only checker decisions differ). Default False
     # keeps the full run's behavior unchanged.
     deterministic_decode: bool = False
+    # Opt-in (semantic only): on reject, constrain the retry to the frontier's derivable next steps
+    # (greedy) instead of blind temperature resampling. Default False -> current behavior + full run
+    # unchanged. See docs/frontier_guided_resampling.md.
+    frontier_guided: bool = False
 
 
 # --------------------------------------------------------------------------------------
@@ -80,6 +84,14 @@ class SemanticStats:
     no_boundary_forced: int = 0
     check_total_s: float = 0.0
     candidate_set_size: int = 0
+    # frontier-guided resampling diagnostics
+    n_frontier_guided: int = 0        # rejects resolved by an E-constrained decode
+    n_frontier_empty: int = 0         # rejects where E was empty -> blind fallback
+    n_constrained_fail: int = 0       # E present but constrained decode not accepted -> blind fallback
+    frontier_synth_s: float = 0.0     # time in expected_steps() (charged to decode latency)
+    guide_build_s: float = 0.0        # time building/compiling per-reject grammars + constrained decode setup
+    e_sizes: list = field(default_factory=list)      # |E| at each guided pass
+    choice_ranks: list = field(default_factory=list) # unconstrained rank of the chosen step when guided
 
     def as_dict(self) -> dict:
         return dict(self.__dict__)
@@ -94,12 +106,16 @@ def semantic_decode(
     sample_fn: Callable,
     cfg: DecodeCfg,
     clock: Callable[[], float] = time.perf_counter,
+    guided_step: Callable | None = None,
 ) -> tuple[list[int], SemanticStats]:
     """Token-by-token decode with sentence-boundary verification and KV-cache rollback.
 
     ``backend`` implements ``seq_len()``, ``decode_step(token)->logits``, ``crop(length)``.
     ``initial_logits`` predicts the first generated token (from the caller's prefill).
     ``sample_fn(logits, temperature, banned_first)`` -> int token id (greedy if temperature<=0).
+    ``guided_step(E, backend, logits, all_ids)`` (optional; used iff ``cfg.frontier_guided``) does a
+    constrained greedy decode of one step over the derivable next steps ``E`` and returns
+    ``(step_toks, next_logits, meta)`` with ``meta`` = {e_size, choice_rank, chosen, n_forward, ok}.
     Returns (generated_token_ids, stats).
 
     Rollback invariant (see plan): at a step boundary ``backend.seq_len() == len(all_ids) == s``
@@ -115,7 +131,8 @@ def semantic_decode(
     while len(gen) < cfg.max_new_tokens and not terminal:
         step_start = backend.seq_len()  # == len(all_ids) == s
         step_toks, logits, info = _emit_step(
-            backend, logits, all_ids, step_start, decode_fn, checker, sample_fn, cfg, stats, clock
+            backend, logits, all_ids, step_start, decode_fn, checker, sample_fn, cfg, stats, clock,
+            guided_step,
         )
         gen.extend(step_toks)
         terminal = info["terminal"]
@@ -126,7 +143,8 @@ def semantic_decode(
 
 
 def _emit_step(
-    backend, logits, all_ids, step_start, decode_fn, checker, sample_fn, cfg, stats, clock
+    backend, logits, all_ids, step_start, decode_fn, checker, sample_fn, cfg, stats, clock,
+    guided_step=None,
 ):
     """Generate one reasoning step with up to ``max_retries`` rollback resamples.
 
@@ -142,6 +160,36 @@ def _emit_step(
             refeed = all_ids[step_start - 1]
             logits = backend.decode_step(refeed)  # cache -> s, logits predict position s
             stats.n_forward_passes += 1
+
+        # Frontier-guided retry (docs/frontier_guided_resampling.md): on reject, constrain the
+        # resample to the derivable next steps instead of blind temperature sampling.
+        if attempt > 0 and cfg.frontier_guided and guided_step is not None:
+            t0 = clock(); E = checker.expected_steps(); stats.frontier_synth_s += clock() - t0
+            if E:
+                t0 = clock()
+                try:
+                    g_toks, g_logits, meta = guided_step(E, backend, logits, all_ids)
+                except Exception:
+                    g_toks, meta = None, None
+                stats.guide_build_s += clock() - t0
+                if g_toks and meta is not None and meta.get("ok", True):
+                    stats.n_forward_passes += meta.get("n_forward", len(g_toks))
+                    stats.n_frontier_guided += 1
+                    stats.e_sizes.append(int(meta.get("e_size", len(E))))
+                    if meta.get("choice_rank") is not None:
+                        stats.choice_ranks.append(int(meta["choice_rank"]))
+                    chosen = meta.get("chosen") or decode_fn(g_toks)
+                    checker.accept(chosen)                # derivable by construction -> accept
+                    return g_toks, g_logits, {"terminal": _is_answer(chosen), "forced": False}
+                # constrained decode failed -> reset to step start and fall through to blind resample
+                stats.n_constrained_fail += 1
+                del all_ids[step_start:]
+                backend.crop(step_start - 1)
+                logits = backend.decode_step(all_ids[step_start - 1])
+                stats.n_forward_passes += 1
+            else:
+                stats.n_frontier_empty += 1
+
         temp = 0.0 if attempt == 0 else cfg.temp_schedule[min(attempt - 1, len(cfg.temp_schedule) - 1)]
 
         step_toks, logits, forced_boundary, saw_eot = _generate_step_tokens(
@@ -498,9 +546,61 @@ def run_symbolic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
     return _finish_row(row, text, item, decode_wall, prefill_wall, len(gen), overhead)
 
 
+def make_guided_step(tokenizer, compiler, vocab_size: int, device, cfg: DecodeCfg):
+    """Build the frontier-constrained greedy decoder injected into ``semantic_decode``.
+
+    Given the derivable next steps ``E``, compiles ``root ::= (e1|...|en) "\\n"`` and greedy-decodes
+    one step under its token mask (so the emitted step is exactly one of ``E`` -> accepted by
+    construction). Records ``|E|`` and, at the first position where the constrained choice differs
+    from the unconstrained argmax, the chosen token's rank in the FULL unconstrained distribution
+    (rank 1 => the LM would have emitted it anyway; >1 => guidance overrode). Returns ok=False on a
+    token-alignment miss so the caller falls back to blind resampling.
+    """
+    import torch
+    import xgrammar as xgr
+
+    def guided_step(E, backend, logits, all_ids):
+        compiled = gr.compile_item_grammar(gr.build_frontier_ebnf(E), compiler)
+        matcher = xgr.GrammarMatcher(compiled)
+        cpu_bitmask = xgr.allocate_token_bitmask(1, vocab_size)
+        gpu_bitmask = torch.empty_like(cpu_bitmask, device=device)
+        step_toks: list[int] = []
+        n_fwd = 0
+        choice_rank = None
+        cur = logits
+        cap = max(16, cfg.per_step_cap * 2)
+        while len(step_toks) < cap:
+            uncon_tok = int(torch.argmax(cur))
+            matcher.fill_next_token_bitmask(cpu_bitmask)
+            gpu_bitmask.copy_(cpu_bitmask)
+            masked = cur.clone()
+            xgr.apply_token_bitmask_inplace(masked, gpu_bitmask)
+            tok = int(torch.argmax(masked))
+            if choice_rank is None and tok != uncon_tok:
+                choice_rank = int((cur > cur[tok]).sum().item()) + 1
+            if not matcher.accept_token(tok):           # token-alignment miss -> fall back to blind
+                return None, cur, {"ok": False, "e_size": len(E)}
+            step_toks.append(tok)
+            all_ids.append(tok)
+            cur = backend.decode_step(tok); n_fwd += 1  # feed every token; advance cache + logits
+            if matcher.is_terminated():
+                break
+        chosen = tokenizer.decode(step_toks, skip_special_tokens=True)
+        return step_toks, cur, {"ok": matcher.is_terminated(), "e_size": len(E),
+                                "choice_rank": choice_rank if choice_rank is not None else 1,
+                                "chosen": chosen, "n_forward": n_fwd}
+
+    return guided_step
+
+
 def run_semantic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: DecodeCfg,
-                 sync, sample_fn, checker, *, model_name: str, gpu: str = "", env_hash: str = "") -> dict:
-    """Token-by-token greedy decode with sentence-boundary verify + KV-cache rollback."""
+                 sync, sample_fn, checker, *, model_name: str, gpu: str = "", env_hash: str = "",
+                 compiler=None) -> dict:
+    """Token-by-token greedy decode with sentence-boundary verify + KV-cache rollback.
+
+    If ``cfg.frontier_guided`` is set, a ``compiler`` (shared XGrammar GrammarCompiler) must be
+    passed so rejects can be resolved by a frontier-constrained resample.
+    """
     _maybe_seed(cfg, item)
     prompt_ids = build_prompt_ids(tokenizer, item, exemplar_item, exemplar_cot)
     backend = HFModelBackend(model, sync)
@@ -515,12 +615,19 @@ def run_semantic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
 
     decode_fn = lambda ids: tokenizer.decode(ids, skip_special_tokens=True)
     prompt_list = prompt_ids[0].tolist()
+    guided_step = None
+    if cfg.frontier_guided:
+        if compiler is None:
+            raise ValueError("cfg.frontier_guided requires a compiler (shared XGrammar GrammarCompiler)")
+        guided_step = make_guided_step(tokenizer, compiler, model.config.vocab_size, backend.device, cfg)
 
     sync(); t0 = time.perf_counter()
-    gen, stats = semantic_decode(backend, logits, prompt_list, decode_fn, checker, sample_fn, cfg)
+    gen, stats = semantic_decode(backend, logits, prompt_list, decode_fn, checker, sample_fn, cfg,
+                                 guided_step=guided_step)
     decode_wall = time.perf_counter() - t0
 
     text = tokenizer.decode(gen, skip_special_tokens=True)
+    e_sizes = stats.e_sizes
     overhead = {"grammar_compile_s": None, "embed_prefill_s": embed_prefill_s,
                 "check_total_s": stats.check_total_s, "n_checks": stats.n_checks,
                 "n_rejects": stats.n_rejects, "n_forced_accepts": stats.n_forced_accepts,
@@ -530,7 +637,14 @@ def run_semantic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
                 "n_forward_passes": stats.n_forward_passes, "raw_forward_s": backend.forward_s,
                 # diagnostic (behavior-neutral): steps whose surface form failed parse_clause --
                 # the prime false-reject channel for the unguided model (connective-prefixed steps).
-                "n_unparsed_steps": getattr(checker, "n_unparsed_steps", 0)}
+                "n_unparsed_steps": getattr(checker, "n_unparsed_steps", 0),
+                # frontier-guided resampling diagnostics
+                "n_frontier_guided": stats.n_frontier_guided, "n_frontier_empty": stats.n_frontier_empty,
+                "n_constrained_fail": stats.n_constrained_fail,
+                "frontier_synth_s": stats.frontier_synth_s, "guide_build_s": stats.guide_build_s,
+                "e_size_mean": (sum(e_sizes) / len(e_sizes)) if e_sizes else None,
+                "frac_E_gt1": (sum(x > 1 for x in e_sizes) / len(e_sizes)) if e_sizes else None,
+                "e_sizes": e_sizes, "choice_ranks": stats.choice_ranks}
     row = _base_row(item, "semantic", model_name, gpu, env_hash)
     return _finish_row(row, text, item, decode_wall, prefill_wall, len(gen), overhead)
 
@@ -585,7 +699,8 @@ def run_all(
                 elif method == "semantic":
                     checker = checker_factory()
                     row = run_semantic(model, tokenizer, item, exemplar_item, exemplar_cot,
-                                       cfg, sync, sample_fn, checker, model_name=model_name, gpu=gpu, env_hash=env_hash)
+                                       cfg, sync, sample_fn, checker, model_name=model_name, gpu=gpu,
+                                       env_hash=env_hash, compiler=compiler)
                 else:
                     raise ValueError(f"unknown method: {method}")
                 row["timestamp"] = ts()

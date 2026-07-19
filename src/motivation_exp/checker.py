@@ -251,6 +251,13 @@ class SemanticChecker:
     def candidate_set_size(self) -> int:
         return len(self._cand_texts)
 
+    def expected_steps(self) -> list[str]:
+        """Public: the derivable next-step surface strings from the current frontier (one-hop).
+
+        Used by frontier-guided resampling to constrain a reject's retry. Small by construction
+        (distractor rules have disjoint concepts and never chain to the gold frontier)."""
+        return [t for t, _ in self._synthesize_expected()]
+
     # ---- internals ----------------------------------------------------------------
     def _embed(self, texts: Sequence[str]) -> np.ndarray:
         arr = np.asarray(self.encode_fn(list(texts)), dtype=np.float32)

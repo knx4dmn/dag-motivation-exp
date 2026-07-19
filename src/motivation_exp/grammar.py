@@ -325,3 +325,16 @@ def make_compiler(tokenizer, vocab_size: int):
 def compile_item_grammar(ebnf: str, compiler):
     """Compile an EBNF string with a shared ``GrammarCompiler`` (cache keys on the string)."""
     return compiler.compile_grammar(ebnf)
+
+
+def build_frontier_ebnf(expected_steps: Sequence[str]) -> str:
+    """Build a tiny per-reject grammar over the derivable next steps (frontier-guided resample).
+
+    ``root ::= ( "<e1>" | "<e2>" | ... ) "\\n"`` -- a literal alternation of the exact E strings so a
+    constrained decode emits one of them verbatim (terminals escaped). The checker then accepts it
+    by construction. Requires a non-empty ``expected_steps``.
+    """
+    if not expected_steps:
+        raise ValueError("cannot build a frontier grammar from an empty expected-step set")
+    alts = " | ".join(f'"{_esc(e)}"' for e in dict.fromkeys(expected_steps))
+    return 'root ::= (' + alts + ') "\\n"\n'
