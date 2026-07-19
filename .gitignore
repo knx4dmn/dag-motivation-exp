@@ -17,3 +17,6 @@ constraints.txt
 
 # The cloned PrOntoQA generator (fetched at runtime, pinned by commit)
 prontoqa/
+
+# Locally downloaded run artifacts (reject dumps, per-bucket data pulled from Drive)
+local_data/
