@@ -126,6 +126,29 @@ def diagnose(items_by_bucket: dict[int, list[Item]]) -> dict:
     return out
 
 
+def summarize_reject_dump(path: str) -> None:
+    """Offline: summarize a reject_dump.jsonl (from Cell 10) -- category counts by bucket.
+
+    category 1 = strip would recover it yet rejected (flag not reaching check time -> bug);
+    category 2 = verbosity/paraphrase the connective list can't reduce;
+    category 3 = well-formed but not derivable -> genuinely wrong (correct reject).
+    """
+    import json
+    from collections import Counter, defaultdict
+    rows = [json.loads(l) for l in open(path) if l.strip()]
+    by_bucket = defaultdict(list)
+    for r in rows:
+        by_bucket[r.get("bucket", 0)].append(r)
+    print(f"{'bucket':>8} {'rejects':>8} {'cat1':>6} {'cat2':>6} {'cat3':>6}")
+    for b in sorted(by_bucket):
+        c = Counter(r["category"] for r in by_bucket[b])
+        print(f"{b:>8} {len(by_bucket[b]):>8} {c[1]:>6} {c[2]:>6} {c[3]:>6}")
+    total = Counter(r["category"] for r in rows)
+    print(f"OVERALL cat1={total[1]} cat2={total[2]} cat3={total[3]} of {len(rows)} rejects")
+    if total[1]:
+        print("!! cat1>0 => strip_connectives not reaching the check-time path (bug).")
+
+
 def probe_parse_robustness() -> None:
     """Show that parse_clause fails on realistic LM phrasings of a VALID step, and that stripping
     connectives recovers them. This is the false-reject channel the gold replay cannot see (the

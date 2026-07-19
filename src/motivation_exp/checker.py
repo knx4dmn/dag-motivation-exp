@@ -127,6 +127,7 @@ class SemanticChecker:
         #     steps). This full-set similarity search is the mechanism -- it always runs, and its
         #     cost grows with the bucket (Panel B / CAM). The guard only VERIFIES the winner.
         sims = self._cand_embs @ emb
+        self._last_sims = sims               # stashed for the diagnostic logger
         j_best = int(np.argmax(sims))
         cos_restate = float(sims[j_best])
         above = np.nonzero(sims >= self.tau_restate)[0]
@@ -160,23 +161,49 @@ class SemanticChecker:
         return self._record(step_text, step_clause, CheckResult(False, cos_mp, matched_mp, None))
 
     def _record(self, step_text, step_clause, result: CheckResult) -> CheckResult:
-        """Optionally log a per-step decision with a false-reject label (diagnostics only)."""
+        """Log a per-step decision, richly for rejects (diagnostics only; see diagnostics/).
+
+        For a rejected step records: the raw model text, parse of the raw, the connective-stripped
+        text and its parse, the top-3 candidate context sentences by cosine (+ scores), whether any
+        ABOVE-tau candidate/expected clause is parse-equal after stripping, and an auto-category:
+          1 = strip WOULD recover it (parse-equal above-tau) yet it was rejected -> if flag ON, the
+              strip isn't reaching the check-time path (bug);
+          2 = strip does NOT yield a parseable clause -> verbosity/paraphrase the closed list misses;
+          3 = strips-and-parses but matches no candidate/expected -> genuinely wrong step (correct reject).
+        """
         if not self.log_decisions:
             return result
-        likely_false_reject = False
-        if not result.accepted:
-            # would a connective-stripped copy parse AND match a candidate / expected clause?
-            norm = gr.parse_clause(gr.strip_connectives(step_text))
-            if norm is not None:
-                restate_hit = any(norm == cc for cc in self._cand_clauses if cc is not None)
-                mp_hit = any(norm == c for _, c in self._synthesize_expected())
-                likely_false_reject = restate_hit or mp_hit
-        self.step_log.append({
+        rec = {
             "step": step_text, "accepted": result.accepted, "kind": result.kind,
             "cosine": result.cosine, "parsed": step_clause is not None,
-            "candidate_set_size": len(self._cand_texts),
-            "likely_false_reject": likely_false_reject,
-        })
+            "candidate_set_size": len(self._cand_texts), "strip_flag": self.strip_connectives,
+        }
+        if not result.accepted:
+            stripped = gr.strip_connectives(step_text)
+            strip_clause = gr.parse_clause(stripped)
+            sims = getattr(self, "_last_sims", None)
+            top3 = []
+            above_texts = []
+            if sims is not None and len(self._cand_texts):
+                order = np.argsort(-sims)[:3]
+                top3 = [(self._cand_texts[int(k)], round(float(sims[int(k)]), 3)) for k in order]
+                above = np.nonzero(sims >= self.tau_restate)[0]
+                above_texts = [(self._cand_texts[int(k)], round(float(sims[int(k)]), 3)) for k in above[:8]]
+            strip_matches = False
+            if strip_clause is not None:
+                cand_hit = any(strip_clause == self._cand_clauses[int(k)]
+                               for k in (np.nonzero(sims >= self.tau_restate)[0] if sims is not None else [])
+                               if self._cand_clauses[int(k)] is not None)
+                mp_hit = any(strip_clause == c for _, c in self._synthesize_expected())
+                strip_matches = bool(cand_hit or mp_hit)
+            category = 1 if strip_matches else (2 if strip_clause is None else 3)
+            rec.update({
+                "raw": step_text, "raw_parse": str(gr.parse_clause(step_text)),
+                "stripped": stripped, "strip_parse": str(strip_clause),
+                "strip_would_match": strip_matches, "category": category,
+                "top3_candidates": top3, "above_tau_candidates": above_texts,
+            })
+        self.step_log.append(rec)
         return result
 
     def _guarded_pick(self, above_idx, sims, step_clause, clause_of):

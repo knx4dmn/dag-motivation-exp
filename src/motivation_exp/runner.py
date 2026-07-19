@@ -60,6 +60,10 @@ class DecodeCfg:
     # REQUIRED on T4 (default 512): SDPA runs the math backend for this GQA model on sm75, so a
     # one-shot 8k prefill OOMs; chunking builds the KV cache incrementally. None disables it.
     prefill_chunk_size: int | None = 512
+    # Opt-in: torch.manual_seed(item.seed) before decoding so resampling is reproducible and an
+    # OFF-vs-ON A/B is controlled (same RNG stream; only checker decisions differ). Default False
+    # keeps the full run's behavior unchanged.
+    deterministic_decode: bool = False
 
 
 # --------------------------------------------------------------------------------------
@@ -387,6 +391,13 @@ class HFModelBackend:
         return self.cache.get_seq_length()
 
 
+def _maybe_seed(cfg: DecodeCfg, item) -> None:
+    """Seed torch RNG per item for reproducible decode when cfg.deterministic_decode is set."""
+    if getattr(cfg, "deterministic_decode", False):
+        import torch
+        torch.manual_seed((item.seed or 0) & 0x7FFFFFFF)
+
+
 def _base_row(item, method: str, model_name: str, gpu: str, env_hash: str) -> dict:
     return {
         "run_id": f"{model_name}:{method}:{item.bucket}:{item.item_id}",
@@ -413,6 +424,7 @@ def _finish_row(row: dict, text: str, item, decode_wall: float, prefill_wall: fl
 def run_unguided(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: DecodeCfg,
                  sync, sample_fn, *, model_name: str, gpu: str = "", env_hash: str = "") -> dict:
     """Plain greedy decode (reference). No logits processor, no checker."""
+    _maybe_seed(cfg, item)
     prompt_ids = build_prompt_ids(tokenizer, item, exemplar_item, exemplar_cot)
     backend = HFModelBackend(model, sync)
     sync(); t0 = time.perf_counter()
@@ -443,6 +455,7 @@ def run_symbolic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
     import torch
     import xgrammar as xgr
 
+    _maybe_seed(cfg, item)
     prompt_ids = build_prompt_ids(tokenizer, item, exemplar_item, exemplar_cot)
     backend = HFModelBackend(model, sync)
 
@@ -488,6 +501,7 @@ def run_symbolic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
 def run_semantic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: DecodeCfg,
                  sync, sample_fn, checker, *, model_name: str, gpu: str = "", env_hash: str = "") -> dict:
     """Token-by-token greedy decode with sentence-boundary verify + KV-cache rollback."""
+    _maybe_seed(cfg, item)
     prompt_ids = build_prompt_ids(tokenizer, item, exemplar_item, exemplar_cot)
     backend = HFModelBackend(model, sync)
 
