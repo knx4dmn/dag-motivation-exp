@@ -610,7 +610,9 @@ def run_semantic(model, tokenizer, item, exemplar_item, exemplar_cot, cfg: Decod
     prefill_wall = time.perf_counter() - t0
 
     te = time.perf_counter()
-    checker.prefill(item.context)
+    _qc = gr.parse_clause(item.question)                    # scope the frontier to the query entity
+    query_entity = _qc.subject if (_qc is not None and _qc.kind == "fact") else None
+    checker.prefill(item.context, query_entity=query_entity)
     embed_prefill_s = time.perf_counter() - te
 
     decode_fn = lambda ids: tokenizer.decode(ids, skip_special_tokens=True)

@@ -85,14 +85,21 @@ class SemanticChecker:
         self._rules: list[tuple[str, str, bool, bool]] = []  # (ante_concept, cons, cons_is_property, negated)
         self._frontier: set[tuple[str, str]] = set()         # (entity, concept) non-negated membership facts
         self._expected_cache: dict[str, np.ndarray] = {}     # expected-string -> emb row
+        # Only facts about the QUERY entity seed the frontier, so E stays the query entity's
+        # one-hop derivable steps and is NOT flooded by the distractor forward-closure (see
+        # diagnostics/inspect_frontier.py). None => admit all entities (legacy / tests without a query).
+        self._query_entity: str | None = None
 
     # ---- setup --------------------------------------------------------------------
-    def prefill(self, context: Sequence[str]) -> None:
+    def prefill(self, context: Sequence[str], query_entity: str | None = None) -> None:
         """Embed all context sentences once and seed the rule set + fact frontier.
 
+        ``query_entity`` scopes the frontier: only that entity's membership facts drive forward
+        chaining, so E is the query entity's derivable next steps (not the distractor closure).
         Each context sentence is parsed ONCE here (cached in ``_cand_clauses``). Timed and
         reported separately by the runner (``embed_prefill_s``).
         """
+        self._query_entity = query_entity
         texts = list(context)
         self._cand_texts = list(texts)
         self._cand_embs = self._embed(texts) if texts else None
@@ -101,14 +108,19 @@ class SemanticChecker:
             self._ingest_clause(c)
 
     def _ingest_clause(self, c) -> None:
-        """Update the rule set / fact frontier from an already-parsed clause."""
+        """Update the rule set / fact frontier from an already-parsed clause.
+
+        Rules are shared (any rule may apply to the query entity). Facts seed the frontier ONLY
+        for the query entity (when set) -- distractor entity facts are excluded, which is what
+        keeps E scoped and small.
+        """
         if c is None:
             return
         if c.kind == "rule":
             self._rules.append((c.subject, c.pred, c.is_property, c.negated))
         elif not c.is_property and not c.negated:
-            # only non-negated concept-membership facts drive forward chaining
-            self._frontier.add((c.subject, c.pred))
+            if self._query_entity is None or c.subject == self._query_entity:
+                self._frontier.add((c.subject, c.pred))
 
     # ---- per-step check -----------------------------------------------------------
     def check_step(self, step_text: str) -> CheckResult:

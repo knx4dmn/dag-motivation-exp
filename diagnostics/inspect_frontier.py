@@ -40,7 +40,7 @@ def inspect(item, max_E_print=12):
     print(f"\n{'='*90}\nitem {item.item_id}  bucket={item.bucket}  query={item.question!r}  "
           f"query_entity={qent}  gold_len={len(item.gold_steps)}  n_context={len(item.context)}")
     chk = SemanticChecker(_dummy_encode, 0.6, 0.6)
-    chk.prefill(item.context)
+    chk.prefill(item.context, query_entity=qent)
     for i, gstep in enumerate(item.gold_steps):
         E = chk.expected_steps()
         gc = gr.parse_clause(gstep)
@@ -72,8 +72,8 @@ def main():
     sizes, gold_hits, gold_total = [], 0, 0
     for it in items:
         inspect(it)
-        chk = SemanticChecker(_dummy_encode, 0.6, 0.6); chk.prefill(it.context)
         qent = _query_entity(it)
+        chk = SemanticChecker(_dummy_encode, 0.6, 0.6); chk.prefill(it.context, query_entity=qent)
         for g in it.gold_steps:
             E = chk.expected_steps(); sizes.append(len(E))
             gc = gr.parse_clause(g)

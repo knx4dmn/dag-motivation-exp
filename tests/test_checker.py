@@ -38,6 +38,46 @@ def _checker(tr=0.95, tm=0.95):
     return c
 
 
+def test_query_entity_scopes_frontier_E_to_query_entity_only():
+    """With distractors present, E must contain ONLY query-entity steps, and the gold MP-fact
+    must be in E at every step of the gold-chain replay (fixes the distractor-flooded E)."""
+    from motivation_exp import grammar as gr
+    context = [
+        "Sam is a grirgpus.",            # gold axiom (query entity = Sam)
+        "Every grirgpus is a trorkpus.", # gold rule
+        "Trorkpuses are large.",         # gold rule (property)
+        "Wren is a krimtpus.",           # distractor entity fact
+        "Every krimtpus is a blompus.",  # distractor rule
+        "Sally is a krerpus.",           # distractor entity fact
+        "Krerpuses are fast.",           # distractor rule (property)
+    ]
+    gold = ["Sam is a grirgpus.", "Every grirgpus is a trorkpus.", "Sam is a trorkpus.",
+            "Trorkpuses are large.", "Sam is large."]
+
+    c = SemanticChecker(_stub_encode, 0.9, 0.9)
+    c.prefill(context, query_entity="Sam")
+
+    def subjects(E):
+        return {gr.parse_clause(e).subject for e in E if gr.parse_clause(e)}
+
+    # every E along the gold chain is about Sam only; gold MP-facts are present when expected
+    for g in gold:
+        E = c.expected_steps()
+        assert subjects(E) <= {"Sam"}, (g, E)          # NO Wren/Sally/distractor steps
+        gc = gr.parse_clause(g)
+        if gc and gc.kind == "fact" and not gc.is_property or (gc and gc.pred == "large"):
+            pass  # (membership + the final property conclusion checked below)
+        c.accept(g)
+
+    # concretely: the two MP-derived gold facts are offered by E at the right moment
+    c2 = SemanticChecker(_stub_encode, 0.9, 0.9); c2.prefill(context, query_entity="Sam")
+    assert "Sam is a trorkpus." in c2.expected_steps()          # hop 1 offered
+    assert subjects(c2.expected_steps()) == {"Sam"}
+    c2.accept("Sam is a grirgpus."); c2.accept("Every grirgpus is a trorkpus.")
+    c2.accept("Sam is a trorkpus.")
+    assert "Sam is large." in c2.expected_steps()               # hop 2 offered after hop 1 accepted
+
+
 def test_prefill_parses_rules_and_frontier():
     c = _checker()
     assert ("tumpus", "wumpus", False, False) in c._rules      # concept rule

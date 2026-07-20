@@ -43,11 +43,12 @@ class _WarnCountingSink:
 class ProntoQABridge:
     """Thin wrapper that imports and drives ``run_experiment`` from a clone directory."""
 
-    def __init__(self, prontoqa_dir: str):
+    def __init__(self, prontoqa_dir: str, seed: int = 0):
         self.dir = os.path.abspath(prontoqa_dir)
         if not os.path.isfile(os.path.join(self.dir, "run_experiment.py")):
             raise FileNotFoundError(f"run_experiment.py not found under {self.dir!r}")
         self._mod = None
+        self._seed = seed
         # aggregate stats across all generate() calls
         self.total_calls = 0        # successful generate() calls
         self.total_tries = 0        # generate_question invocations (incl. retries)
@@ -70,6 +71,10 @@ class ProntoQABridge:
                 sys.path.insert(0, self.dir)
             with self._cwd():
                 self._mod = importlib.import_module("run_experiment")
+            # PrOntoQA draws from BOTH the stdlib `random` and `numpy.random` (theory.py/proof.py),
+            # so seed both -> reproducible Phase 1 generation.
+            self._mod.seed(self._seed)
+            self._mod.np.random.seed(self._seed)
         return self._mod
 
     @property
