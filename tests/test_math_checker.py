@@ -78,6 +78,22 @@ def test_candidate_set_size_is_context_length():
     assert _checker().candidate_set_size == len(CONTEXT)
 
 
+# --------------------------------------------------------------------------------------
+# trace precedence (edge case 2): intermediate/problem take priority over distractor
+# --------------------------------------------------------------------------------------
+def test_trace_intermediate_priority_over_distractor():
+    c = MathChecker(); c.prefill(["Sam had 48 apples.", "A shop sold 24 toys."], [1, 0])
+    assert c.check_step("24 + 5 = 29").failed == "provenance_distractor"   # 24 distractor-only
+    c.accept("48 / 2 = 24")                                                # 24 now a derived intermediate
+    assert c.check_step("24 + 5 = 29").accepted                           # intermediate beats distractor
+
+
+def test_trace_problem_priority_over_distractor():
+    # 24 appears in BOTH a problem sentence and a distractor sentence -> legitimate (problem wins)
+    c = MathChecker(); c.prefill(["Sam had 24 apples.", "A shop sold 24 toys."], [1, 0])
+    assert c.check_step("24 + 5 = 29").accepted
+
+
 def test_scan_is_uncached_no_prebuilt_index(monkeypatch):
     # no persistent quantity index: an identical re-check re-scans the raw context (same work)
     import motivation_exp.math_checker as mc

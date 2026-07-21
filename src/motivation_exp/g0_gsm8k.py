@@ -47,16 +47,20 @@ def extract_number_answer(text: str) -> str | None:
 def posthoc_verdicts(item, cot_text: str):
     """Segment CoT into calculation steps (lines with `= <number>`) and check each post-hoc.
 
-    Each step is accepted regardless of verdict so downstream provenance uses the model's OWN chain
-    (its derived intermediates). Returns list of (step_line, MathCheckResult)."""
+    RECORD-ALL semantics (edge case 1): after checking a step we record its result as a derived
+    intermediate **regardless of the step's own verdict** -- there is no resampling in G0, so a later
+    step referencing an earlier (even wrong) result must trace to 'intermediate', not 'missing'. This
+    charges each step only its own first-order error and prevents an arithmetic failure from
+    cascading into spurious 'missing' verdicts that could falsely trigger STOP-a. (The real runner
+    uses accepted-only semantics instead.) Returns list of (step_line, MathCheckResult)."""
     chk = MathChecker()
     chk.prefill(item.context, item.relevance)
     out = []
     for line in cot_text.splitlines():
         if parse_calculation(line) is None:
             continue
-        out.append((line.strip(), chk.check_step(line)))
-        chk.accept(line)
+        out.append((line.strip(), chk.check_step(line)))   # verdict charged to THIS step only
+        chk.accept(line)                                    # record its result regardless of verdict
     return out
 
 

@@ -70,6 +70,15 @@ def test_g0_verdict_stop_a_when_missing_dominates():
     assert g0_verdict(agg) == "STOP_A"                  # missing class dominates -> model mismatch
 
 
+def test_posthoc_no_cascade_from_arithmetic_failure():
+    # step1 fails arithmetic (48/2 != 25); step2 uses the model's derived 25 -> must NOT be 'missing'
+    it = _item()
+    r = g0_item(it, "In May she sold 48 / 2 = 25 clips.\nThen 25 + 48 = 73 clips.\n#### 73")
+    v = r["verdicts"]
+    assert v[0]["accepted"] is False and v[0]["failed"] == "arithmetic"   # charged only its own error
+    assert v[1]["accepted"] is True                                       # 25 recorded -> no cascade
+
+
 def test_g0_verdict_fix_prompting_on_low_parse():
     it = _item()
     rows = [g0_item(it, "Let me think about this problem carefully. The answer is 5.")   # no calc line

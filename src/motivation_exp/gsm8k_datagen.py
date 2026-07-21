@@ -222,20 +222,27 @@ def generate_distractors(base: GSMItem, n: int, seed: int) -> list[str]:
     rng = random.Random(seed)
     names = base.names or _DEFAULT_NAMES
     lo, hi = _num_range(base)
-    # amendment 2: a distractor number must NOT collide with this item's problem quantities (any
-    # formatting variant) -- else a distractor reference would trace to the problem and corrupt G0(b).
-    problem_fracs = set()
+    # amendment 2 (+ edge case): a distractor number must NOT collide with this item's problem
+    # quantities NOR its gold intermediate results (any formatting variant) -- else a distractor
+    # reference would trace to a legitimate quantity and corrupt G0(b) attribution.
+    excluded_fracs = set()
     for q in base.problem_quantities:
         try:
-            problem_fracs.add(to_fraction(q))
+            excluded_fracs.add(to_fraction(q))
         except (ValueError, ZeroDivisionError):
             pass
+    for step in base.gold_steps:                       # gold intermediate results (known at datagen)
+        if "=" in step:
+            try:
+                excluded_fracs.add(to_fraction(step.split("=", 1)[1]))
+            except (ValueError, ZeroDivisionError):
+                pass
     out, seen = [], set()
     attempts = 0
     while len(out) < n and attempts < n * 30:
         attempts += 1
         num = rng.randint(lo, hi)
-        if is_whitelist_constant(str(num)) or Fraction(num) in problem_fracs:
+        if is_whitelist_constant(str(num)) or Fraction(num) in excluded_fracs:
             continue
         s = rng.choice(DISTRACTOR_TEMPLATES).format(
             name=rng.choice(names), num=num, obj=rng.choice(_OBJECTS))

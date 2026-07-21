@@ -70,21 +70,25 @@ class MathChecker:
     def _trace(self, num: str) -> str:
         """Return where a quantity comes from: 'problem' | 'intermediate' | 'distractor' | 'missing'.
 
-        Fresh, index-free linear scan of the raw context every call (the CAM cost). A match in ANY
-        original-problem sentence wins immediately; otherwise a distractor-only match is reported.
-        Small whitelist constants (half->2, dozen->12, %->100) are exempt from tracing (they are
-        operation constants, not retrievable quantities); distractor numbers avoid the whitelist by
-        construction, so this exemption never hides a distractor.
+        Fresh, index-free linear scan of the raw context every call (the CAM cost).
+
+        TRACE PRECEDENCE (an operand that value-collides with several sources is legitimate if ANY
+        legitimate source matches -- edge case 2): whitelist constant > derived intermediate >
+        original-problem sentence > distractor. So a number appearing in BOTH a problem/intermediate
+        AND a distractor sentence is NOT flagged distractor-referencing; only a distractor-ONLY match
+        (no problem/intermediate source) rejects. Whitelist constants (half->2, %->100) are exempt;
+        datagen keeps distractor numbers off the whitelist AND off the problem/gold-intermediate
+        values, so these exemptions never hide a genuine distractor reference.
         """
         if is_whitelist_constant(num):
             return "constant"
-        if num in self._intermediates:
+        if num in self._intermediates:                 # derived intermediates take priority
             return "intermediate"
         found_distractor = False
         for sent, rel in zip(self._context, self._relevance):
             if num in extract_numbers(sent):
                 if rel == 1:
-                    return "problem"
+                    return "problem"                   # a problem-sentence match wins over any distractor
                 found_distractor = True
         return "distractor" if found_distractor else "missing"
 
@@ -110,7 +114,16 @@ class MathChecker:
         return MathCheckResult(True, None, None, cosine=1.0, kind="calc")
 
     def accept(self, step_text: str) -> None:
-        """Add an accepted step's result to the derived-intermediates set."""
+        """Record a step's result as a derived intermediate (available to downstream provenance).
+
+        MODE DISTINCTION (edge case 1):
+        - Real runner (semantic arm): call this ONLY on a step the checker ACCEPTED (accepted-only
+          semantics -- a rejected step is resampled and its result is discarded).
+        - G0 post-hoc: call this on EVERY emitted step regardless of its verdict (record-all
+          semantics -- there is no resampling, so downstream steps reference the model's own chain).
+          This charges each step only its own first-order error and prevents one arithmetic failure
+          from cascading into spurious 'missing' verdicts. See g0_gsm8k.posthoc_verdicts.
+        """
         calc = parse_calculation(step_text)
         if calc is not None:
             self._intermediates.add(calc[1])

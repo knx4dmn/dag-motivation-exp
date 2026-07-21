@@ -77,9 +77,11 @@ def test_distractors_seeded_unique_use_item_names():
     # amendment 2: no distractor number collides with the item's problem quantities (or whitelist)
     from fractions import Fraction
     prob = {Fraction(q) for q in it.problem_quantities}
+    gold_results = {Fraction(s.split("=", 1)[1]) for s in it.gold_steps}   # {24, 72}
     for s in d1:
         for num in g.extract_numbers(s):
-            assert Fraction(num) not in prob and not g.is_whitelist_constant(num)
+            f = Fraction(num)
+            assert f not in prob and f not in gold_results and not g.is_whitelist_constant(num)
 
 
 # --------------------------------------------------------------------------------------

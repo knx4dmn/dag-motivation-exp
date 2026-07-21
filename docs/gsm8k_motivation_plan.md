@@ -89,6 +89,20 @@ At each step boundary (a line containing `= <number>`, amendment D2), verify:
   the Panel B / CAM signal. The scan is the timed region.
 - **Exact rational arithmetic** (`fractions.Fraction`) everywhere a computed value is compared.
 
+## Two G0-mode edge cases (confirmed in code + tests)
+1. **Record-all vs accepted-only intermediates.** The derived-intermediate set records a step's
+   result **regardless of that step's own verdict in G0 post-hoc** (record-all), so an arithmetic
+   failure can't cascade into spurious `missing` verdicts downstream (which could falsely trigger
+   STOP-a); each step is charged only its own first-order error. The **real runner uses
+   accepted-only** (a rejected step is resampled, its result discarded). The two modes are explicit
+   in `MathChecker.accept`'s docstring and the two call sites.
+2. **Value-collision trace precedence.** `_trace` precedence is whitelist > derived intermediate >
+   original-problem sentence > distractor: an operand that value-collides with a legitimate source
+   is NOT flagged distractor-referencing; only a distractor-ONLY match rejects. Since intermediates
+   are unpredictable at datagen, this precedence handles runtime collisions; additionally datagen
+   excludes distractor numbers that collide with the problem quantities **or the gold intermediate
+   results** (known at datagen), tightening G0(b) attribution.
+
 ## G0 — overlap & attributability pre-flight gate  (runs AFTER checker, BEFORE grammar)
 Purpose: catch a model↔task or checker↔task mismatch BEFORE building guidance/grammar (the exact
 failure we hit late on PrOntoQA). **~40 items/bucket** (amendment 4), mid buckets **1k/2k**,
