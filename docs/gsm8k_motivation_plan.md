@@ -69,6 +69,13 @@ At each step boundary (a line containing `= <number>`, amendment D2), verify:
   The relevance bit is ground truth from datagen, so this is an **oracle upper bound** on semantic
   verification (stand-in for DAG-provided relevance). Cost grows with the bucket (more sentences to
   scan) → Panel B / CAM. The latency accounting wraps this scan (`perf_counter`, same discipline).
+  - **Small-constant exemption (implementation note, needs your ack).** Operands equal to a
+    whitelist constant {0–10, 12, 100} are exempt from tracing — they are operation constants
+    (`half`→2, `dozen`→12, `%`→100), not retrievable quantities; without this, valid `48/2` steps
+    would be rejected and G0's step-pass rate would be artificially ~0. This is the SAME whitelist
+    the symbolic arm allows. To keep it from hiding a distractor, **datagen generates distractor
+    numbers to AVOID the whitelist** (range starts at 13, excludes 100), so a distractor quantity is
+    always provenance-catchable — G0(b) stays valid. Flagging since amendment A didn't spell this out.
 - **(b) Arithmetic check (amendment B).** Parse `<expr> = <result>`; assert `eval(expr) == result`
   using **`fractions.Fraction` (exact rational), not float equality** (GSM8K has divisions).
 - Accept iff (a) ∧ (b); on accept, add `result` to derived-intermediates (the growing set).

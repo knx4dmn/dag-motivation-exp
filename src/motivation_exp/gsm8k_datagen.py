@@ -38,6 +38,21 @@ def to_fraction(tok: str) -> Fraction:
     return Fraction(normalize_number(tok))
 
 
+# Small constants the model may legitimately introduce (half->2, twice->2, dozen->12, %->100).
+# Used by BOTH arms: symbolic grammar allows them as operands; the semantic provenance check
+# exempts them from tracing. Distractor numbers are generated to AVOID this set, so a distractor
+# quantity always remains provenance-catchable (keeps G0(b) valid).
+CONST_WHITELIST = tuple(range(0, 11)) + (12, 100)
+_WHITELIST_FRAC = {Fraction(n) for n in CONST_WHITELIST}
+
+
+def is_whitelist_constant(num: str) -> bool:
+    try:
+        return to_fraction(num) in _WHITELIST_FRAC
+    except (ValueError, ZeroDivisionError):
+        return False
+
+
 def extract_numbers(text: str) -> list[str]:
     """All numeric tokens in ``text``, normalized, de-duplicated in first-seen order."""
     out, seen = [], set()
@@ -194,11 +209,16 @@ def _num_range(base: GSMItem) -> tuple[int, int]:
         except ValueError:
             pass
     hi = max(vals) * 2 if vals else 50
-    return 1, max(5, hi)
+    # start above the constant whitelist (<=12) so every distractor quantity is provenance-catchable
+    return 13, max(20, hi)
 
 
 def generate_distractors(base: GSMItem, n: int, seed: int) -> list[str]:
-    """Generate up to ``n`` unique, seeded distractor sentences (irrelevant; never change the answer)."""
+    """Generate up to ``n`` unique, seeded distractor sentences (irrelevant; never change the answer).
+
+    Numbers avoid the constant whitelist so distractor-use is always catchable by the semantic
+    provenance check (G0(b)).
+    """
     rng = random.Random(seed)
     names = base.names or _DEFAULT_NAMES
     lo, hi = _num_range(base)
@@ -206,8 +226,11 @@ def generate_distractors(base: GSMItem, n: int, seed: int) -> list[str]:
     attempts = 0
     while len(out) < n and attempts < n * 20:
         attempts += 1
-        tmpl = rng.choice(DISTRACTOR_TEMPLATES)
-        s = tmpl.format(name=rng.choice(names), num=rng.randint(lo, hi), obj=rng.choice(_OBJECTS))
+        num = rng.randint(lo, hi)
+        if is_whitelist_constant(str(num)):        # avoid {..,100} that slipped into range
+            continue
+        s = rng.choice(DISTRACTOR_TEMPLATES).format(
+            name=rng.choice(names), num=num, obj=rng.choice(_OBJECTS))
         if s not in seen:
             seen.add(s)
             out.append(s)
