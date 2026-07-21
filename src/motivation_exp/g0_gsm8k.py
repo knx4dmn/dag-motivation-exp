@@ -78,35 +78,80 @@ def g0_item(item, cot_text: str) -> dict:
 
 
 def g0_aggregate(rows) -> dict:
-    """Per-bucket (a) step-pass rate and (b) catchable fraction among wrong-answer items."""
+    """Per-bucket stats + a pooled entry.
+
+    Reports (a) step-pass rate WITH its failure decomposition {missing, distractor, arithmetic}
+    (amendment 1), a parse rate (fraction of items with >=1 detected calculation line, amendment 3),
+    and (b) catchable fraction among wrong-answer items -- per bucket AND pooled (amendment 4).
+    """
     by = defaultdict(list)
     for r in rows:
         by[r["bucket"]].append(r)
+
+    def _fail_counts(rs):
+        fm = fd = fa = 0
+        for r in rs:
+            for v in r["verdicts"]:
+                if not v["accepted"]:
+                    fm += v["failed"] == "provenance_missing"
+                    fd += v["failed"] == "provenance_distractor"
+                    fa += v["failed"] == "arithmetic"
+        return fm, fd, fa
+
     out = {}
     for b, rs in by.items():
         steps = sum(r["n_checkable"] for r in rs)
         passed = sum(r["n_pass"] for r in rs)
         wrong = [r for r in rs if not r["correct"]]
-        catch = sum(r["has_reject"] for r in wrong)
+        fm, fd, fa = _fail_counts(rs)
+        parsed = sum(r["n_checkable"] >= 1 for r in rs)
         out[b] = {"n_items": len(rs), "acc": sum(r["correct"] for r in rs) / max(1, len(rs)),
+                  "parse_rate": parsed / max(1, len(rs)),
                   "step_pass": passed / max(1, steps), "n_steps": steps,
-                  "n_wrong": len(wrong), "catchable_frac": catch / max(1, len(wrong))}
+                  "fail_missing": fm, "fail_distractor": fd, "fail_arith": fa,
+                  "n_wrong": len(wrong), "catchable_frac": sum(r["has_reject"] for r in wrong) / max(1, len(wrong))}
+    all_rows = [r for rs in by.values() for r in rs]
+    wrong_all = [r for r in all_rows if not r["correct"]]
+    fm, fd, fa = _fail_counts(all_rows)
+    out["_pooled"] = {"n_wrong": len(wrong_all), "fail_missing": fm, "fail_distractor": fd, "fail_arith": fa,
+                      "catchable_frac": sum(r["has_reject"] for r in wrong_all) / max(1, len(wrong_all))}
     return out
 
 
-def print_g0(agg: dict, pass_a: float = 0.50, pass_b: float = 1 / 3) -> None:
-    print(f"{'bucket':>7} {'items':>6} {'acc':>6} {'(a)step_pass':>13} {'(b)catchable':>13} {'n_wrong':>8}")
-    for b in sorted(agg):
+def g0_verdict(agg: dict, pass_a: float = 0.50, pass_b: float = 1 / 3, min_parse: float = 0.70) -> str:
+    """PROCEED / STOP-a / STOP-b / FIX-PROMPTING per the decomposed-threshold rule (amendment 1)."""
+    buckets = [b for b in agg if b != "_pooled"]
+    if any(agg[b]["parse_rate"] < min_parse for b in buckets):
+        return "FIX_PROMPTING"
+    p = agg["_pooled"]
+    # STOP-on-(a) ONLY if the missing class dominates the failures (PrOntoQA-style mismatch)
+    if p["fail_missing"] > p["fail_distractor"] + p["fail_arith"]:
+        return "STOP_A"
+    if p["catchable_frac"] < pass_b:
+        return "STOP_B"
+    return "PROCEED"   # includes step_pass < pass_a when failures are healthy (distractor + arithmetic)
+
+
+def print_g0(agg: dict, pass_a: float = 0.50, pass_b: float = 1 / 3, min_parse: float = 0.70) -> None:
+    buckets = [b for b in agg if b != "_pooled"]
+    print(f"{'bucket':>7} {'items':>6} {'acc':>6} {'parse':>6} {'(a)pass':>8}  "
+          f"{'fail m/d/a':>12}  {'(b)catch':>9} {'n_wrong':>8}")
+    for b in sorted(buckets):
         a = agg[b]
-        print(f"{b:>7} {a['n_items']:>6} {a['acc']:>6.2f} {a['step_pass']:>13.2f} "
-              f"{a['catchable_frac']:>13.2f} {a['n_wrong']:>8}")
-    a_ok = all(agg[b]["step_pass"] >= pass_a for b in agg)
-    b_ok = all(agg[b]["catchable_frac"] >= pass_b for b in agg)
-    print(f"\nG0 thresholds: (a) step_pass >= {pass_a:.2f} in all -> {a_ok}; "
-          f"(b) catchable >= {pass_b:.2f} in all -> {b_ok}")
-    print("VERDICT:", "PROCEED to steps 3-4" if (a_ok and b_ok) else
-          "STOP -- " + ("(a) low: model-task mismatch, escalate model" if not a_ok else
-                        "(b) low: checker not discriminative, consider HotpotQA-distractor/MuSiQue"))
+        print(f"{b:>7} {a['n_items']:>6} {a['acc']:>6.2f} {a['parse_rate']:>6.2f} {a['step_pass']:>8.2f}  "
+              f"{a['fail_missing']:>3}/{a['fail_distractor']:>3}/{a['fail_arith']:<3}  "
+              f"{a['catchable_frac']:>9.2f} {a['n_wrong']:>8}")
+    p = agg["_pooled"]
+    print(f"\npooled (b) catchable = {p['catchable_frac']:.2f} over {p['n_wrong']} wrong items "
+          f"| pooled failures missing/distractor/arith = {p['fail_missing']}/{p['fail_distractor']}/{p['fail_arith']}")
+    v = g0_verdict(agg, pass_a, pass_b, min_parse)
+    msg = {
+        "FIX_PROMPTING": f"FIX PROMPTING first: parse rate < {min_parse:.2f} in some bucket (few detected calculations).",
+        "STOP_A": "STOP (a): the MISSING/hallucinated-quantity class dominates failures -> model-task mismatch; escalate (Qwen2.5-3B / 7B int8).",
+        "STOP_B": f"STOP (b): pooled catchable {p['catchable_frac']:.2f} < {pass_b:.2f} -> checker not discriminative; pivot (HotpotQA-distractor / MuSiQue).",
+        "PROCEED": "PROCEED to steps 3-4. (If (a) < 0.50, failures are the healthy distractor+arithmetic kind -> shows up in (b).)",
+    }[v]
+    print("VERDICT:", msg)
 
 
 def run_g0(model, tokenizer, items, *, n_per_bucket: int = 20, max_new_tokens: int = 400):

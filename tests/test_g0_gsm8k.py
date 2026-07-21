@@ -1,7 +1,7 @@
 """CPU-only tests for the G0 core: number extraction, post-hoc step verdicts, attributability."""
 from __future__ import annotations
 
-from motivation_exp.g0_gsm8k import extract_number_answer, g0_item, g0_aggregate
+from motivation_exp.g0_gsm8k import extract_number_answer, g0_item, g0_aggregate, g0_verdict
 from motivation_exp.gsm8k_datagen import GSMItem
 
 
@@ -44,14 +44,36 @@ def test_g0_item_checker_invisible_wrong_plan():
     assert r["n_pass"] == 1 and r["correct"] is False and r["has_reject"] is False
 
 
-def test_g0_aggregate_step_pass_and_catchable():
+def test_g0_aggregate_decomposition_parse_pooled_and_verdict():
     it = _item()
     rows = [
         g0_item(it, "In May she sold 48 / 2 = 24 clips.\n48 + 24 = 72\n#### 72"),  # correct, 2 pass
-        g0_item(it, "She sold 99 / 3 = 33 clips.\n#### 33"),                        # wrong, catchable
+        g0_item(it, "She sold 99 / 3 = 33 clips.\n#### 33"),                        # wrong, distractor
         g0_item(it, "She sold 48 * 2 = 96 clips.\n#### 96"),                        # wrong, invisible
     ]
-    agg = g0_aggregate(rows)[512]
-    assert agg["n_items"] == 3 and agg["n_wrong"] == 2
-    assert agg["step_pass"] == 3 / 4                    # (2 + 0 + 1) / (2 + 1 + 1)
-    assert agg["catchable_frac"] == 1 / 2               # 1 of 2 wrong items had a rejected step
+    agg = g0_aggregate(rows)
+    a = agg[512]
+    assert a["step_pass"] == 3 / 4 and a["catchable_frac"] == 1 / 2
+    assert a["parse_rate"] == 1.0                       # every item has >=1 calculation
+    assert (a["fail_missing"], a["fail_distractor"], a["fail_arith"]) == (0, 1, 0)
+    assert agg["_pooled"]["catchable_frac"] == 1 / 2
+    # healthy mix (distractor dominates missing) + catchable >= 1/3 -> PROCEED
+    assert g0_verdict(agg) == "PROCEED"
+
+
+def test_g0_verdict_stop_a_when_missing_dominates():
+    it = _item()
+    rows = [g0_item(it, "She sold 17 * 5 = 85 clips.\n#### 85")   # 17 and 85 both hallucinated
+            for _ in range(3)]
+    agg = g0_aggregate(rows)
+    assert agg["_pooled"]["fail_missing"] > 0
+    assert g0_verdict(agg) == "STOP_A"                  # missing class dominates -> model mismatch
+
+
+def test_g0_verdict_fix_prompting_on_low_parse():
+    it = _item()
+    rows = [g0_item(it, "Let me think about this problem carefully. The answer is 5.")   # no calc line
+            for _ in range(3)]
+    agg = g0_aggregate(rows)
+    assert agg[512]["parse_rate"] == 0.0
+    assert g0_verdict(agg) == "FIX_PROMPTING"

@@ -91,28 +91,28 @@ At each step boundary (a line containing `= <number>`, amendment D2), verify:
 
 ## G0 — overlap & attributability pre-flight gate  (runs AFTER checker, BEFORE grammar)
 Purpose: catch a model↔task or checker↔task mismatch BEFORE building guidance/grammar (the exact
-failure we hit late on PrOntoQA). ~20 items, mid buckets **1k/2k**, **unguided only**, no
-accept/reject/resample — **observation only**.
-1. Generate unguided CoT solutions; run the checker **post-hoc** on every emitted step.
+failure we hit late on PrOntoQA). **~40 items/bucket** (amendment 4), mid buckets **1k/2k**,
+**unguided greedy only**, **observation only**. Prompt uses the reserved real GSM8K calculation-format
+few-shot exemplar (amendment 3), not zero-shot.
+1. Generate unguided CoT; run the checker **post-hoc** on every calculation step.
 2. Report per bucket:
-   - **(a) step-pass rate** = fraction of unguided steps the checker would accept (model-distribution
-     overlap with the checkable-valid set; the analog of PrOntoQA's `rank` diagnostic).
-   - **(b) error attributability** = among wrong-answer items, fraction whose **first bad step** is
-     checker-catchable (references a distractor quantity, or fails arithmetic) vs checker-invisible
-     (wrong plan / wrong operation with clean arithmetic).
-3. **Pre-committed thresholds (proposed — awaiting sign-off):**
-   - **PROCEED** to steps 3–4 iff **(a) step-pass rate ≥ 50%** in *both* 1k and 2k buckets **AND**
-     **(b) catchable fraction ≥ 1/3** (≥ 33% of wrong-answer items have a checker-catchable first
-     bad step).
-   - **If (a) < 50%** (approaching the PrOntoQA ~0 regime) → model-task mismatch → **stop**, escalate
-     model (Qwen2.5-3B, then Llama/Qwen-7B int8); do NOT build the rest of the pipeline.
-   - **If (b) < 1/3** → checker has no discriminative signal on this task's real failure modes →
-     **stop and flag**; candidate pivot = multi-hop QA with distractor paragraphs (HotpotQA
-     distractor setting / MuSiQue).
-   - (Rationale: (a) ≥ 50% means the model's own steps are majority-checkable, so guidance has
-     something to steer toward; (b) ≥ 1/3 means the checker addresses a real, non-trivial slice of
-     the actual errors. Both are deliberately modest — this is a go/no-go, not a success bar.)
-4. Log per-item, per-step verdicts so the G0 table becomes failure-analysis material either way.
+   - **parse rate** = fraction of items with ≥ 1 detected calculation line (amendment 3). If low,
+     **fix prompting before interpreting (a)/(b)** — the model isn't producing checkable steps.
+   - **(a) step-pass rate**, **decomposed into failure classes {missing, distractor-only, arithmetic}**
+     (amendment 1). ``missing`` = operand traces nowhere (hallucinated / unparseable); ``distractor``
+     = operand traces only to a distractor sentence; ``arithmetic`` = wrong `=`.
+   - **(b) catchable fraction** among wrong-answer items (first bad step checker-catchable), reported
+     **per bucket AND pooled across 1k/2k** (amendment 4; (b) conditions on wrong items, which are few
+     per bucket).
+3. **Verdict (decomposed thresholds; proposed — awaiting sign-off):**
+   - **FIX PROMPTING** if parse rate < 0.70 in any bucket.
+   - **STOP-on-(a)** [escalate model: Qwen2.5-3B → 7B int8] **ONLY if the `missing` class dominates**
+     the pooled failures (`missing > distractor + arithmetic`) — that is the PrOntoQA-style mismatch.
+     A low step-pass driven by `distractor + arithmetic` is **healthy signal**, not a stop.
+   - **STOP-on-(b)** [pivot: HotpotQA-distractor / MuSiQue] if **pooled catchable < 1/3**.
+   - **PROCEED** otherwise — including `step-pass < 0.50` when failures are the healthy
+     distractor+arithmetic kind (it then shows up in (b)). Nominal bars stay (a) ≥ 0.50, (b) ≥ 1/3.
+4. Log per-item, per-step verdicts (`g0_verdicts.jsonl`) as failure-analysis material either way.
 
 ## 3. grammar spec (symbolic baseline)
 Static per-item calculation-format EBNF: output is a sequence of `<expr> = <number>` lines then a

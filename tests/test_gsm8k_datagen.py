@@ -74,6 +74,12 @@ def test_distractors_seeded_unique_use_item_names():
     assert it.names == ["Natalia"]                        # months excluded from the name pool
     assert all(any(nm in s for nm in it.names) for s in d1)   # names from the item's entity pool
     assert all(s.endswith(".") for s in d1)
+    # amendment 2: no distractor number collides with the item's problem quantities (or whitelist)
+    from fractions import Fraction
+    prob = {Fraction(q) for q in it.problem_quantities}
+    for s in d1:
+        for num in g.extract_numbers(s):
+            assert Fraction(num) not in prob and not g.is_whitelist_constant(num)
 
 
 # --------------------------------------------------------------------------------------
