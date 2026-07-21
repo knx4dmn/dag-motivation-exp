@@ -128,25 +128,45 @@ few-shot exemplar (amendment 3), not zero-shot.
      distractor+arithmetic kind (it then shows up in (b)). Nominal bars stay (a) ≥ 0.50, (b) ≥ 1/3.
 4. Log per-item, per-step verdicts (`g0_verdicts.jsonl`) as failure-analysis material either way.
 
-## 3. grammar spec (symbolic baseline)
-Static per-item calculation-format EBNF: output is a sequence of `<expr> = <number>` lines then a
-final answer line (`#### <number>`), operators `+ - * /`. **Operands = ALL numbers in the
-post-injection context** (problem + distractors) **plus a small-constant whitelist {0–10, 12, 100}**
-(amendment A) — NOT `problem_quantities`, and **no relevance oracle on the symbolic arm**. This
-enforces **syntactic/lexical** validity (well-formed calculations over any in-context number) but
-neither relevance nor arithmetic correctness — the asymmetry that makes symbolic a meaningful
-baseline, and it keeps G0(b)'s "references a distractor quantity = catchable" consistent (only the
-semantic arm's oracle rejects distractor operands). Compiled once per item via XGrammar.
+## 3. grammar spec (symbolic baseline) — BUILT (`gsm8k_grammar.py`)
+Calculation-format EBNF: output is a sequence of `<expr> = <number>` lines then a final answer line
+(`#### <number>`), operators `+ - * /`.
 
-## 4. runner / plots — carry-over + FLAGGED domain changes
-Reused unchanged: the three run loops, rollback/resample, timing, resume, prompting, plots skeleton.
-Genuine math-domain changes (flagged, not silent):
+**Operand-vocabulary decision (supersedes amendment A's "operands = all context numbers"; user
+sign-off 2026-07): FORMAT-ONLY.** Operands and results are free digit strings; the grammar constrains
+only the calculation FORMAT, not the operand vocabulary. Why the change: a STATIC grammar cannot
+enumerate derived intermediates (e.g. `24 + 48 = 72` where `24` was computed earlier and never
+appears in the problem text), so a context-only operand rule would make every multi-step chain
+ungrammatical. A dynamic per-step grammar that admitted intermediates would recompile each step and
+make the symbolic arm's latency GROW with context — defeating the "symbolic flat" half of Panel B.
+Format-only keeps the grammar **item-independent and static** (compiled ONCE, reused for every item →
+flat latency) and preserves the three-arm ladder: unguided (free) < symbolic (well-formed
+calculations, no relevance filter — may freely use a distractor number) < semantic (format +
+provenance + exact arithmetic). Symbolic guarantees lexical well-formedness only, never correctness.
+Note: with format-only operands, symbolic no longer *lexically* forbids distractor operands; the
+distractor-vs-legit distinction lives entirely in the semantic arm's checker (as G0(b) intends).
+
+## 4. runner / plots — BUILT (`gsm8k_runner.py`; plots reused as-is)
+Reused unchanged from the PrOntoQA path: `HFModelBackend` (DynamicCache + chunked prefill +
+crop/re-feed rollback), the torch helpers, the JSONL resume/append helpers, `DecodeCfg`,
+`SemanticStats`, and **all of `plots.py`** (it is domain-agnostic — keys on `method`/`bucket`/
+`correct`/`per_token_ms`). The GSM8K semantic decode is a dedicated core (`math_semantic_decode`) —
+the same rollback index math, but line-boundary steps, `####` terminal, prose pass-through, and no
+frontier-guided path. Genuine math-domain changes (flagged, not silent):
 - **`extract_answer`**: parse the final **number** (`#### N` / last number), not `True/False`.
 - **checker**: new `MathChecker` (arithmetic + quantity retrieval); **drops the sentence-transformers
   / bge dependency** from the semantic path (no embeddings). `[colab]` extra loses `sentence-transformers`.
 - **grammar**: calculation EBNF; **no exemplar-from-templates** (use a real GSM8K CoT exemplar).
 - **Phase 1.5 (τ calibration): removed.**
-- **Step-boundary detection**: calculation-line detector, not the period `split_sentences` rule.
+- **Step-boundary detection**: line boundary (`\n`), not the period `split_sentences` rule.
+- **Prose pass-through (semantic arm)**: only calculation lines are checked; a non-calc (prose) line
+  is accepted without a check or rollback. Semantic rejects/resamples ONLY on a distractor operand, a
+  missing/hallucinated operand, or wrong arithmetic. (PrOntoQA checked every line.)
+- **Accepted-only intermediates (real runner)** vs G0's record-all — the two modes are explicit in
+  `MathChecker.accept`; the runner records a step's result only when the checker accepts it.
+- **Dual few-shot exemplar**: unguided/semantic use the prose CoT (`EXEMPLAR_COT`, exactly the prompt
+  G0 validated at parse rate 0.70–0.80); symbolic uses a bare grammar-conformant CoT
+  (`EXEMPLAR_COT_BARE`) so its demo matches what the grammar forces (no phrasing-mismatch faking).
 - **frontier-guided machinery**: NOT ported (stays on the PrOntoQA branch).
 - Plots caption: math domain, "retrieval + exact-arithmetic step check," correctness = exact numeric match.
 
