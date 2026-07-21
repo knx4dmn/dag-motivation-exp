@@ -20,7 +20,7 @@ from dataclasses import dataclass, field, asdict
 from fractions import Fraction
 from typing import Callable, Sequence
 
-from .datagen import CountTokens  # type alias reuse
+from .datagen import CountTokens, hf_token_counter  # reuse token-counter helper + type alias
 
 # --------------------------------------------------------------------------------------
 # Numbers + safe rational arithmetic
