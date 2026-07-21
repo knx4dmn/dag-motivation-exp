@@ -22,22 +22,42 @@ from typing import Sequence
 
 from .gsm8k_datagen import extract_numbers, is_whitelist_constant, normalize_number, safe_eval, to_fraction
 
-# a calculation embedded in free CoT text: "<expr> = <number>", expr has >=1 operator
-_OP = r"[-+*/]"
-_CALC_RE = re.compile(
-    r"([\d][\d.,$\s()]*(?:" + _OP + r"[\d.,$\s()]+)+)\s*=\s*(-?\$?[\d,]+(?:\.\d+)?)"
-)
+_RESULT_RE = re.compile(r"=\s*(-?\$?[\d,]+(?:\.\d+)?)")
+_TOKEN_RE = re.compile(r"(-?\$?\d[\d,]*(?:\.\d+)?|[-+*/])")
 
 
 def parse_calculation(step_text: str) -> tuple[str, str] | None:
-    """Extract the (expr, result) of the calculation on a step line, or None if there is none."""
-    text = step_text.replace("×", "*").replace("÷", "/")   # × ÷
-    matches = list(_CALC_RE.finditer(text))
-    if not matches:
+    """Extract the (expr, result) of the calculation on a step line, or None if there is none.
+
+    Robust to real CoT: tolerates unit words between the numbers ("2 bolts + 1 bolt = 3 bolts"),
+    ``x``/``×`` for multiply, ``$`` and thousands commas. Anchors on the LAST ``= <number>`` and then
+    walks BACKWARD collecting the maximal trailing `num (op num)+` run (words break the run), so
+    stray earlier numbers are ignored. Returns None if no such calculation is present.
+    """
+    text = step_text.replace("×", "*").replace("÷", "/")
+    text = re.sub(r"(?<=\d)\s*[xX]\s*(?=\d)", " * ", text)   # 3 x 4 / 3x4 -> 3 * 4
+    results = list(_RESULT_RE.finditer(text))
+    if not results:
         return None
-    m = matches[-1]
-    expr = m.group(1).strip()
-    return expr, normalize_number(m.group(2))
+    m = results[-1]
+    result = normalize_number(m.group(1))
+    toks = _TOKEN_RE.findall(text[:m.start()])
+    run, want_num = [], True
+    for t in reversed(toks):
+        is_op = t in "+-*/"
+        if want_num:
+            if is_op:
+                break
+            run.append(t); want_num = False
+        else:
+            if not is_op:
+                break
+            run.append(t); want_num = True
+    run.reverse()
+    if len(run) < 3 or run[0] in "+-*/" or run[-1] in "+-*/" or not any(t in "+-*/" for t in run):
+        return None
+    expr = " ".join(normalize_number(t) if t not in "+-*/" else t for t in run)
+    return expr, result
 
 
 @dataclass

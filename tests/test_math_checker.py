@@ -24,10 +24,18 @@ def _checker():
 # calculation parsing
 # --------------------------------------------------------------------------------------
 def test_parse_calculation_from_free_text():
-    assert parse_calculation("In May she sold 48/2 = 24 clips.") == ("48/2", "24")
+    assert parse_calculation("In May she sold 48/2 = 24 clips.") == ("48 / 2", "24")
     assert parse_calculation("Altogether 48 + 24 = 72.") == ("48 + 24", "72")
     assert parse_calculation("She has 48 clips.") is None          # no operator -> not a calc
     assert parse_calculation("Total is 6 * 7 = 42 items") == ("6 * 7", "42")
+
+
+def test_parse_calculation_tolerates_units_and_x_multiply():
+    # unit words between numbers, and 'x' as multiply -- must still parse (raises G0 parse rate)
+    assert parse_calculation("2 bolts + 1 bolt = 3 bolts.") == ("2 + 1", "3")
+    assert parse_calculation("So 3 x 4 = 12 apples.") == ("3 * 4", "12")
+    assert parse_calculation("She had 5 apples. Then 2 + 1 = 3.") == ("2 + 1", "3")   # ignores stray 5
+    assert parse_calculation("$48 / 2 = $24") == ("48 / 2", "24")
 
 
 # --------------------------------------------------------------------------------------

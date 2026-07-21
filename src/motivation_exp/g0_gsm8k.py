@@ -28,8 +28,11 @@ EXEMPLAR_Q = ("Natalia sold clips to 48 of her friends in April, and then she so
               "clips in May. How many clips did Natalia sell altogether in April and May?")
 EXEMPLAR_COT = ("In May she sold 48 / 2 = 24 clips.\n"
                 "Altogether she sold 48 + 24 = 72 clips.\n#### 72")
-SYSTEM_PROMPT = ("Solve the math word problem step by step. Show each calculation on its own line in "
-                 "the form 'a op b = c', then end with a line '#### <answer>'.")
+SYSTEM_PROMPT = (
+    "Solve the math word problem step by step. Put EVERY arithmetic operation on its own line as a "
+    "bare calculation using ONLY digits and + - * / = , for example '48 / 2 = 24' (do not put words, "
+    "units, or currency symbols inside the equation). Use one operation per line. Finish with a line "
+    "exactly of the form '#### <final number>'.")
 
 
 def extract_number_answer(text: str) -> str | None:
@@ -176,8 +179,10 @@ def run_g0(model, tokenizer, items, *, n_per_bucket: int = 20, max_new_tokens: i
                 {"role": "user", "content": " ".join(it.context + [it.question])},
             ]
             ids = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_tensors="pt").to(model.device)
+            attn = torch.ones_like(ids)          # explicit mask (pad==eos otherwise warns / misbehaves)
             with torch.inference_mode():
-                out = model.generate(ids, max_new_tokens=max_new_tokens, do_sample=False,
+                out = model.generate(ids, attention_mask=attn, max_new_tokens=max_new_tokens,
+                                     do_sample=False, temperature=None, top_p=None,
                                      pad_token_id=tokenizer.eos_token_id)
             cot = tokenizer.decode(out[0, ids.shape[1]:], skip_special_tokens=True)
             rows.append(g0_item(it, cot))
